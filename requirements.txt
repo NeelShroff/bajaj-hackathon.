@@ -12,3 +12,4 @@ llama-index-embeddings-openai
 llama-index-vector-stores-pinecone
 tiktoken
 python-dotenv
+gunicorn

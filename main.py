@@ -362,4 +362,12 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
     return HackRxResponse(answers=answers)
     
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True, log_level=config.LOG_LEVEL.lower())
+    # Use the PORT environment variable if available, otherwise default to 8000
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port,
+        reload=False,  # Disable reload in production
+        log_level=config.LOG_LEVEL.lower()
+    )
