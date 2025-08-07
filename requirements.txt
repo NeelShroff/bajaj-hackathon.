@@ -1,15 +1,22 @@
+# Core Application Dependencies
 fastapi
-uvicorn
+uvicorn[standard]  # Installs uvicorn with necessary dependencies
 pydantic
 requests
-PyPDF2
-pinecone-client
-openai
-llama-index
+
+# Document Processing & RAG Pipeline
+PyMuPDF
+tabulate
+pypdf # For PDF handling
+python-docx
 llama-index-core
 llama-index-llms-openai
 llama-index-embeddings-openai
 llama-index-vector-stores-pinecone
-tiktoken
+pinecone-client
+openai
+tiktoken # Used by OpenAI models for token counting
+
+# Utility & Deployment (Optional but recommended)
 python-dotenv
 gunicorn

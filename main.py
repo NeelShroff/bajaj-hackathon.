@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
 LLM-Powered Intelligent Document Query System - FastAPI Server
-This server provides an API for document loading, querying, and batch processing.
 Refactored for LlamaIndex with a focus on performance optimization.
 """
 import logging
@@ -12,6 +11,8 @@ import tempfile
 import asyncio
 import uvicorn
 import time
+import docx
+import json
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Security
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -20,31 +21,44 @@ from pydantic import BaseModel, Field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
+from urllib.parse import urlparse
+
+# Import libraries for new document types and advanced parsing
+import PyPDF2
+from email.message import Message
+import pypdf
+import fitz # PyMuPDF for robust PDF and image handling
+from tabulate import tabulate # For converting tables to markdown
 
 # Ensure the project structure is correct for imports
 sys.path.append(os.path.join(os.path.dirname(__file__), 'src'))
 
 from config import config
 from src.query_processor import QueryProcessor
-from llama_index.core import VectorStoreIndex, SimpleDirectoryReader, Settings
+from llama_index.core import VectorStoreIndex, Settings
 from llama_index.core.ingestion import IngestionPipeline
 from llama_index.core.storage.storage_context import StorageContext
-from llama_index.core.node_parser import SentenceSplitter
+from llama_index.core.node_parser import SentenceSplitter, SentenceWindowNodeParser
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.pinecone import PineconeVectorStore
 from pinecone import Pinecone
-import PyPDF2
 from llama_index.llms.openai import OpenAI
 from llama_index.core.schema import Document
 
 # Configure logging
 logging.basicConfig(
     level=getattr(logging, config.LOG_LEVEL),
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)ss - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# --- Pydantic models (moved to the top to prevent NameErrors) ---
+# --- Pydantic models ---
+class DecisionResponse(BaseModel):
+    decision: str
+    amount: Optional[float] = None
+    justification: str
+    clauses: List[str]
+
 class QueryRequest(BaseModel):
     query: str
     document_path: Optional[str] = None
@@ -60,15 +74,12 @@ class HackRxResponse(BaseModel):
 query_processor: QueryProcessor = QueryProcessor()
 pipeline: Optional[IngestionPipeline] = None
 index: Optional[VectorStoreIndex] = None
-executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
+executor = ThreadPoolExecutor(max_workers=os.cpu_count() * 2 or 8) 
 pc_client = Pinecone(api_key=config.PINECONE_API_KEY)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Handles startup and shutdown events for the application.
-    This replaces the deprecated @app.on_event("startup") and "shutdown" decorators.
-    """
+    """Handles startup and shutdown events for the application."""
     global index, pipeline
     logger.info("🚀 System initialization started on startup.")
     Settings.embed_model = OpenAIEmbedding(model=config.EMBEDDING_MODEL)
@@ -77,7 +88,6 @@ async def lifespan(app: FastAPI):
     Settings.chunk_overlap = config.CHUNK_OVERLAP
 
     try:
-        # Fixed: Call names() method instead of treating it as a property
         existing_indexes = pc_client.list_indexes().names()
         if config.PINECONE_INDEX_NAME not in existing_indexes:
             logger.info(f"🔍 Pinecone index '{config.PINECONE_INDEX_NAME}' not found. Creating a new one...")
@@ -99,6 +109,17 @@ async def lifespan(app: FastAPI):
         storage_context = StorageContext.from_defaults(vector_store=pinecone_vector_store)
         index = VectorStoreIndex([], storage_context=storage_context, show_progress=True)
         
+        # Corrected node parser configuration, fixing the TypeError
+        node_parser = SentenceWindowNodeParser.from_defaults(
+            window_size=3,
+            window_metadata_key="window",
+            original_text_metadata_key="original_text",
+            sentence_splitter=SentenceSplitter(
+                chunk_size=config.CHUNK_SIZE,
+                chunk_overlap=config.CHUNK_OVERLAP
+            )
+        )
+
         pipeline = IngestionPipeline(
             transformations=[
                 SentenceSplitter(chunk_size=config.CHUNK_SIZE, chunk_overlap=config.CHUNK_OVERLAP),
@@ -119,7 +140,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="LLM Document Processing System",
     description="Intelligent query-retrieval system for unstructured documents, powered by LlamaIndex.",
-    version="2.1.0",
+    version="2.1.3",
     lifespan=lifespan
 )
 
@@ -144,7 +165,7 @@ def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(
 async def root():
     return {
         "message": "LLM Document Processing System",
-        "version": "2.1.0 (LlamaIndex)",
+        "version": "2.1.3 (LlamaIndex)",
         "status": "running"
     }
 
@@ -173,58 +194,134 @@ async def health_check():
         logger.error(f"❌ Health check failed: {e}")
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
-async def _process_pdf_page(file_path: str, page_num: int) -> str:
-    """Helper function to extract text from a single PDF page concurrently."""
-    return await asyncio.to_thread(_thread_process_pdf_page_with_pypdf2, file_path, page_num)
+# --- Document Processing Helpers ---
+async def _extract_text_from_pdf(file_path: Path) -> List[str]:
+    """Extracts text, tables, and images from a PDF file using PyMuPDF."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, _thread_process_pdf_file, file_path)
 
-def _thread_process_pdf_page_with_pypdf2(file_path: str, page_num: int) -> str:
-    """Synchronous function for PyPDF2 text extraction to be run in a thread pool."""
+def _thread_process_pdf_file(file_path: Path) -> List[str]:
+    """Synchronous PDF text, table, and image extraction for the thread pool."""
+    all_pages_text = []
     try:
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            page = reader.pages[page_num]
-            return page.extract_text() or ""
+        doc = fitz.open(file_path)
+        for page_num, page in enumerate(doc):
+            page_text = f"\n--- PAGE {page_num + 1} ---\n\n"
+            
+            # Extract tables and convert to markdown
+            tables = page.find_tables()
+            for table in tables:
+                table_data = table.extract()
+                # Use tabulate to create a markdown table representation
+                table_md = tabulate(table_data, headers="firstrow", tablefmt="pipe")
+                page_text += f"[TABLE_START]\n{table_md}\n[TABLE_END]\n\n"
+            
+            # Extract plain text
+            page_text += page.get_text() or ""
+            
+            all_pages_text.append(page_text)
     except Exception as e:
-        logger.warning(f"PyPDF2 extraction failed for page {page_num}: {e}")
-        return ""
+        logger.error(f"Failed to extract content from PDF file {file_path}: {e}")
+        return []
+    return all_pages_text
+
+async def _extract_text_from_docx(file_path: Path) -> List[str]:
+    """Extracts text from a DOCX file."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, _thread_process_docx_file, file_path)
+
+def _thread_process_docx_file(file_path: Path) -> List[str]:
+    """Synchronous DOCX text extraction for the thread pool."""
+    full_text = ""
+    try:
+        doc = docx.Document(file_path)
+        for paragraph in doc.paragraphs:
+            full_text += paragraph.text + '\n'
+    except Exception as e:
+        logger.error(f"Failed to extract text from DOCX file {file_path}: {e}")
+        return []
+    return [full_text] # Return as a list for consistency
+
+async def _extract_text_from_email(file_path: Path) -> List[str]:
+    """Extracts text from an EML file."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(executor, _thread_process_email_file, file_path)
+
+def _thread_process_email_file(file_path: Path) -> List[str]:
+    """Synchronous email text extraction for the thread pool."""
+    full_text = ""
+    try:
+        with open(file_path, 'rb') as fp:
+            msg = Message()
+            msg.set_content(fp.read())
+            if msg.is_multipart():
+                for part in msg.walk():
+                    ctype = part.get_content_type()
+                    if ctype == 'text/plain':
+                        full_text += part.get_payload(decode=True).decode() + '\n'
+            else:
+                full_text = msg.get_payload(decode=True).decode()
+    except Exception as e:
+        logger.error(f"Failed to extract text from email file {file_path}: {e}")
+        return []
+    return [full_text] # Return as a list for consistency
 
 async def _load_and_index_from_url(document_url: str):
-    """Helper function to load and index a document from a URL using LlamaIndex with optimizations."""
+    """Helper function to load and index a document from a URL."""
     global index, pipeline
     if not pipeline:
-         raise RuntimeError("Ingestion pipeline is not initialized.")
+        raise RuntimeError("Ingestion pipeline is not initialized.")
     logger.info(f"🌐 Downloading document from URL: {document_url}")
     
     temp_dir = tempfile.mkdtemp()
-    temp_path = Path(temp_dir) / 'document.pdf'
     
     try:
         start_download = time.time()
         response = requests.get(document_url, timeout=60)
         response.raise_for_status()
+        
+        # Corrected file name parsing to handle invalid URL characters
+        parsed_url = urlparse(document_url)
+        clean_filename = os.path.basename(parsed_url.path)
+        
+        if not clean_filename:
+            clean_filename = "document.pdf"
+            
+        temp_path = Path(temp_dir) / clean_filename
         temp_path.write_bytes(response.content)
         logger.info(f"📁 Document downloaded in {time.time() - start_download:.2f}s.")
         
         start_processing = time.time()
-        with open(temp_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            num_pages = len(reader.pages)
         
-        logger.info(f"⚙️ Starting parallel text extraction for {num_pages} pages...")
-        processing_tasks = [_process_pdf_page(str(temp_path), i) for i in range(num_pages)]
-        pages_content = await asyncio.gather(*processing_tasks)
+        file_extension = temp_path.suffix.lower()
+        if file_extension == '.pdf':
+            extractor = _extract_text_from_pdf
+        elif file_extension == '.docx':
+            extractor = _extract_text_from_docx
+        elif file_extension == '.eml':
+            extractor = _extract_text_from_email
+        else:
+            raise ValueError(f"Unsupported document type: {file_extension}")
         
-        full_text = "\n".join(pages_content)
-        logger.info(f"✅ Text extraction completed in {time.time() - start_processing:.2f}s. Total characters extracted: {len(full_text)}")
+        # This now returns a list of strings
+        list_of_texts = await extractor(temp_path)
+        
+        if not list_of_texts:
+            raise ValueError("Text extraction from document failed or returned empty content.")
 
-        documents = [Document(text=full_text, metadata={"source": document_url})]
+        logger.info(f"✅ Text extraction completed in {time.time() - start_processing:.2f}s. Total pages extracted: {len(list_of_texts)}")
+        
+        # Create a Document object for each page with enhanced metadata
+        documents = [
+            Document(text=text, metadata={"source": document_url, "page_number": i + 1})
+            for i, text in enumerate(list_of_texts)
+        ]
         
         start_ingestion = time.time()
         logger.info("📦 Starting LlamaIndex ingestion pipeline...")
         await pipeline.arun(documents=documents)
         logger.info(f"🎉 Ingestion pipeline completed in {time.time() - start_ingestion:.2f}s.")
         
-        # Fixed: Need to recreate index reference after ingestion
         pinecone_vector_store = PineconeVectorStore(
             pinecone_client=pc_client,
             index_name=config.PINECONE_INDEX_NAME,
@@ -240,13 +337,13 @@ async def _load_and_index_from_url(document_url: str):
         logger.error(f"❌ Error loading and indexing document from URL: {e}")
         raise
     finally:
-        if temp_path.exists():
-            os.remove(temp_path)
-            logger.info(f"🗑️ Deleted temporary file: {temp_path}")
         if Path(temp_dir).exists():
+            for item in Path(temp_dir).iterdir():
+                os.remove(item)
             os.rmdir(temp_dir)
             logger.info(f"🗑️ Deleted temporary directory: {temp_dir}")
 
+# --- API Endpoints ---
 @app.post("/load-and-index", tags=["Document Management"])
 async def load_and_index_document(request: dict, token: str = Depends(verify_token)):
     """Loads and indexes a document from a URL into the Pinecone index."""
@@ -267,8 +364,8 @@ async def load_and_index_document(request: dict, token: str = Depends(verify_tok
         raise HTTPException(status_code=500, detail=f"Error loading document: {str(e)}")
 
 @app.post("/query", tags=["Querying"])
-async def process_query(request: QueryRequest, token: str = Depends(verify_token)) -> Dict[str, Any]:
-    """Processes a single query against the indexed documents."""
+async def process_query(request: QueryRequest, token: str = Depends(verify_token)) -> DecisionResponse:
+    """Processes a single query against the indexed documents and returns a structured decision."""
     global index
     if index is None:
         raise HTTPException(status_code=404, detail="No document index available. Please load a document first.")
@@ -281,24 +378,13 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
     )
 
     try:
-        response = await query_engine.aquery(request.query)
-        
-        source_nodes = response.source_nodes
-        sources = [node.metadata.get('source', 'Unknown') for node in source_nodes]
-        confidence = sum(node.score for node in source_nodes) / len(source_nodes) if source_nodes else 0.0
-
+        decision_dict = await query_processor.process_query_for_decision(request.query, query_engine)
         end_time = time.time()
+        
         logger.info(f"✅ Query processed successfully in {end_time - start_time:.2f}s.")
-        logger.debug(f"🔍 Sources found: {sources}")
-        logger.debug(f"📊 Confidence score: {confidence:.2f}")
+        
+        return DecisionResponse(**decision_dict)
 
-        return {
-            "answer": str(response),
-            "confidence": confidence,
-            "sources": sources,
-            "reasoning": "Answer generated from retrieved context by LlamaIndex.",
-            "metadata": {}
-        }
     except Exception as e:
         logger.error(f"❌ Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
@@ -306,7 +392,7 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
 @app.post("/hackrx/run", tags=["Hackathon"])
 async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> HackRxResponse:
     """
-    **Optimized for speed.** This endpoint now handles both document loading and batch querying
+    Handles both document loading and batch querying
     using LlamaIndex's powerful query engine and parallel processing capabilities.
     """
     global index
@@ -344,13 +430,13 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
     )
 
     async def process_single_question(question: str):
-        logger.info(f"  - Starting query for question: '{question}'")
+        logger.info(f"   - Starting query for question: '{question}'")
         try:
-            response = await query_engine.aquery(question)
-            logger.info(f"  - Finished query for question: '{question}'")
-            return str(response)
+            decision_response = await query_processor.process_query_for_decision(question, query_engine)
+            logger.info(f"   - Finished query for question: '{question}'")
+            return decision_response['justification']
         except Exception as e:
-            logger.error(f"  - Failed to process question '{question}': {e}")
+            logger.error(f"   - Failed to process question '{question}': {e}")
             return "Error processing this question."
 
     tasks = [process_single_question(q) for q in request.questions]
@@ -362,12 +448,11 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
     return HackRxResponse(answers=answers)
     
 if __name__ == "__main__":
-    # Use the PORT environment variable if available, otherwise default to 8000
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=port,
-        reload=False,  # Disable reload in production
+        reload=False,
         log_level=config.LOG_LEVEL.lower()
     )

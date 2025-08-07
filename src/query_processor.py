@@ -1,14 +1,17 @@
+# src/query_processor.py
+
 import re
 import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
-from openai import OpenAI, AsyncOpenAI
+from openai import AsyncOpenAI
+import json
 
 from config import config
+from llama_index.core.query_engine import BaseQueryEngine
 
 logger = logging.getLogger(__name__)
 
-# Use async version of LLM client
 async_llm_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
 
 @dataclass
@@ -28,7 +31,6 @@ class QueryProcessor:
     """Processes natural language queries and extracts structured information."""
     
     def __init__(self):
-        # We don't need a separate client here as we'll use the async one globally.
         pass
     
     async def _enhance_query_with_llm(self, query: str) -> Dict[str, Any]:
@@ -52,42 +54,18 @@ class QueryProcessor:
                 model=config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=500
+                max_tokens=500,
+                # Using the new, robust JSON mode
+                response_format={"type": "json_object"}
             )
             
-            import json
             llm_response = response.choices[0].message.content.strip()
-            if not llm_response:
-                logger.warning("LLM returned empty response")
-                return self._get_default_query_result()
-            
-            if llm_response.startswith('```json'):
-                llm_response = llm_response[7:]
-            if llm_response.startswith('```'):
-                llm_response = llm_response[3:]
-            if llm_response.endswith('```'):
-                llm_response = llm_response[:-3]
-            
-            try:
-                result = json.loads(llm_response)
-                if not isinstance(result, dict):
-                    logger.warning("LLM response is not a dictionary")
-                    return self._get_default_query_result()
-                
-                required_fields = ['key_entities', 'constraints', 'query_type', 'confidence']
-                for field in required_fields:
-                    if field not in result:
-                        result[field] = [] if field == 'key_entities' else {} if field == 'constraints' else 'general_inquiry' if field == 'query_type' else 0.5
-                
-                return result
-            except json.JSONDecodeError as e:
-                logger.error(f"JSON parsing failed: {e}. Response content: {llm_response[:100]}...")
-                return self._get_default_query_result()
-            
+            return json.loads(llm_response)
+        
         except Exception as e:
             logger.error(f"Error enhancing query with LLM: {e}")
             return self._get_default_query_result()
-            
+    
     def _get_default_query_result(self) -> Dict[str, Any]:
         """Return a default query result structure when LLM enhancement fails."""
         return {
@@ -97,48 +75,71 @@ class QueryProcessor:
             "confidence": 0.5
         }
     
-    def create_search_queries(self, query: str, enhanced_result: Dict[str, Any]) -> List[str]:
-        """Dynamically create search queries based on the LLM's structured output."""
-        queries = [query]
-        
-        entities = enhanced_result.get('key_entities', [])
-        constraints = enhanced_result.get('constraints', {})
-        query_type = enhanced_result.get('query_type', 'general_inquiry')
-        
-        base_query_parts = entities + [f"{k}: {v}" for k, v in constraints.items() if v]
-        if base_query_parts:
-            queries.append(" ".join(base_query_parts))
+    async def process_query_for_decision(self, query: str, query_engine: BaseQueryEngine) -> Dict[str, Any]:
+        """
+        Main method to process a query, retrieve information, and generate a structured decision.
+        Now includes multi-step reasoning for interlinked information.
+        """
+        logger.info(f"Processing query for structured decision: {query}")
 
-        if query_type == 'coverage_check' and entities:
-            queries.append(f"coverage for {', '.join(entities)}")
+        # 1. Initial Retrieval
+        initial_response = await query_engine.aquery(query)
+        retrieved_text = initial_response.response
+        source_nodes = initial_response.source_nodes
+
+        # 2. Check for interlinked references and perform a second search if necessary
+        second_query_needed = False
+        reference_keywords = ["refer to", "see section", "as per", "in the table", "as shown in the table"]
+        for keyword in reference_keywords:
+            if keyword in retrieved_text.lower():
+                second_query_needed = True
+                break
+
+        if second_query_needed:
+            logger.info("Detected interlinked reference. Performing a secondary, targeted query.")
+            secondary_query = f"Based on the initial context: '{retrieved_text}', provide a full answer to the user's original query: '{query}'. Include information from all relevant sections and tables."
+            secondary_response = await query_engine.aquery(secondary_query)
+            retrieved_text = f"{retrieved_text}\n\n[Secondary Search Result]:\n{secondary_response.response}"
+            source_nodes.extend(secondary_response.source_nodes)
+
+        clauses = [node.get_text() for node in source_nodes]
+        sources = list(set([node.metadata.get('source', 'Unknown') for node in source_nodes]))
         
-        if query_type == 'amount_inquiry' and entities:
-            queries.append(f"limit for {', '.join(entities)}")
+        # 3. Use a new LLM call to synthesize a structured decision
+        try:
+            decision_prompt = f"""
+            Based on the following document context, provide a direct and concise answer to the user query. The answer should be a single, coherent statement and should use information directly from the provided context without adding any external details. If the context does not contain the answer, state that the information is not available.
+
+            Document Context:
+            ---
+            {retrieved_text}
+            ---
+
+            User Query: "{query}"
+
+            Direct Answer: 
+            """
             
-        if query_type == 'eligibility_check' and entities:
-            queries.append(f"conditions for {', '.join(entities)}")
-        
-        if not entities and not constraints:
-            queries.append(query.lower())
+            decision_response = await async_llm_client.chat.completions.create(
+                model=config.OPENAI_MODEL,
+                messages=[{"role": "user", "content": decision_prompt}],
+                temperature=0.1,
+                max_tokens=1000
+            )
 
-        return list(dict.fromkeys(queries))
+            answer_content = decision_response.choices[0].message.content.strip()
 
-    async def process_query(self, query: str) -> Dict[str, Any]:
-        """Main method to process a query and return structured information and search queries."""
-        logger.info(f"Processing query: {query}")
-        
-        # Use LLM to extract entities and query type in a general way
-        enhanced_result = await self._enhance_query_with_llm(query)
-        
-        # Dynamically generate search queries from the LLM's output
-        search_queries = self.create_search_queries(query, enhanced_result)
-        
-        return {
-            "original_query": query,
-            "enhanced_extraction": enhanced_result,
-            "search_queries": search_queries,
-            "processing_metadata": {
-                "method": "llm-driven",
-                "confidence": enhanced_result.get("confidence", 0.7)
+            return {
+                "justification": answer_content,
+                "decision": "Approved" if answer_content and "not available" not in answer_content.lower() else "Rejected",
+                "amount": None,
+                "clauses": clauses
             }
-        }
+        except Exception as e:
+            logger.error(f"Error processing decision with LLM: {e}")
+            return {
+                "justification": "Error processing this question.",
+                "decision": "Error",
+                "amount": None,
+                "clauses": clauses
+            }
