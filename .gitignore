@@ -1,0 +1,32 @@
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environment
+venv/
+
+# Environment variables
+.env
+
+# FAISS index files (large ML model files)
+data/faiss_index.faiss
+data/faiss_index.pkl
+
+# Cache directories
+data/cli_cache/
+
+# Debug files
+debug_*.py
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
