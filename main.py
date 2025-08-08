@@ -51,6 +51,17 @@ logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+# Utility to detect effectively empty answers from upstream libraries
+def _is_empty_answer_text(text: str) -> bool:
+    try:
+        normalized = (text or "").strip().lower()
+        if normalized in {"", "empty response", "no answer", "n/a", "na", "none", "null"}:
+            return True
+        # Treat extremely short answers as empty/noise
+        return len(normalized) < 3
+    except Exception:
+        return False
+
 
 # --- Pydantic models (moved to the top to prevent NameErrors) ---
 class QueryRequest(BaseModel):
@@ -69,6 +80,7 @@ query_processor: QueryProcessor = QueryProcessor()
 pipeline: Optional[IngestionPipeline] = None
 index: Optional[VectorStoreIndex] = None
 pg_index: Optional[PropertyGraphIndex] = None
+neo4j_pg_store: Optional[Neo4jPropertyGraphStore] = None
 neo4j_driver = None
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 pc_client = Pinecone(api_key=config.PINECONE_API_KEY)
@@ -80,7 +92,7 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events for the application.
     This replaces the deprecated @app.on_event("startup") and "shutdown" decorators.
     """
-    global index, pipeline, pg_index, neo4j_driver
+    global index, pipeline, pg_index, neo4j_driver, neo4j_pg_store
     logger.info("🚀 System initialization started on startup.")
     Settings.embed_model = OpenAIEmbedding(model=config.EMBEDDING_MODEL)
     Settings.llm = OpenAI(model=config.OPENAI_MODEL)
@@ -123,7 +135,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning(f"Neo4j connectivity check failed: {e}")
 
-            graph_store = Neo4jPropertyGraphStore(
+            neo4j_pg_store = Neo4jPropertyGraphStore(
                 username=config.NEO4J_USERNAME,
                 password=config.NEO4J_PASSWORD,
                 url=config.NEO4J_URI,
@@ -131,7 +143,7 @@ async def lifespan(app: FastAPI):
             )
             pg_index = PropertyGraphIndex.from_documents(
                 documents=[],
-                property_graph_store=graph_store,
+                property_graph_store=neo4j_pg_store,
                 embed_model=Settings.embed_model,
                 show_progress=False,
             )
@@ -241,6 +253,52 @@ async def health_check():
         logger.error(f"❌ Health check failed: {e}")
         raise HTTPException(status_code=500, detail=f"Health check failed: {str(e)}")
 
+# --------- Neo4j helpers ---------
+def _is_empty_answer(ans: Any) -> bool:
+    try:
+        s = str(ans).strip()
+    except Exception:
+        return True
+    return s == "" or s.lower() == "empty response"
+
+def _neo4j_ensure_indexes() -> None:
+    if neo4j_driver is None:
+        return
+    try:
+        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+            # Neo4j 5 schema DDL with IF NOT EXISTS
+            session.run(
+                "CREATE CONSTRAINT doc_source IF NOT EXISTS FOR (d:Document) REQUIRE d.source IS UNIQUE"
+            )
+            session.run(
+                "CREATE FULLTEXT INDEX pageTextIndex IF NOT EXISTS FOR (p:Page) ON EACH [p.text]"
+            )
+    except Exception as e:
+        logger.debug(f"Neo4j index creation warning: {e}")
+
+def _neo4j_upsert_pages(source_url: str, pages: List[Document]) -> None:
+    if neo4j_driver is None:
+        return
+    try:
+        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+            for doc in pages:
+                page_no = int(doc.metadata.get("page", 0)) if doc.metadata else 0
+                text = doc.text or ""
+                session.run(
+                    (
+                        "MERGE (d:Document {source: $source}) "
+                        "ON CREATE SET d.createdAt = timestamp() "
+                        "MERGE (p:Page {source: $source, page: $page}) "
+                        "SET p.text = $text "
+                        "MERGE (d)-[:HAS_PAGE]->(p)"
+                    ),
+                    source=source_url,
+                    page=page_no,
+                    text=text,
+                )
+    except Exception as e:
+        logger.warning(f"Neo4j upsert pages failed: {e}")
+
 async def _process_pdf_page(file_path: str, page_num: int) -> str:
     """Helper function to extract text from a single PDF page concurrently."""
     return await asyncio.to_thread(_thread_process_pdf_page_with_pymupdf_first, file_path, page_num)
@@ -288,6 +346,9 @@ async def _load_and_index_from_url(document_url: str):
             documents.append(
                 Document(text=page_text, metadata={"source": document_url, "page": i + 1})
             )
+        # Persist in Neo4j synchronously to guarantee graph availability
+        _neo4j_ensure_indexes()
+        _neo4j_upsert_pages(document_url, documents)
         
         start_ingestion = time.time()
         logger.info("📦 Starting LlamaIndex ingestion pipeline...")
@@ -311,17 +372,8 @@ async def _load_and_index_from_url(document_url: str):
             logger.warning(f"Vector index refresh failed: {e}; rebuilding empty index handle.")
             index = VectorStoreIndex([], storage_context=storage_context, show_progress=False)
 
-        # Also upsert into the property graph for schema-rich retrieval (best-effort)
-        try:
-            if pg_index is not None:
-                # Prefer async API if available to avoid nested event loop issues
-                if hasattr(pg_index, "arefresh_ref_docs"):
-                    await pg_index.arefresh_ref_docs(documents)  # type: ignore[attr-defined]
-                elif hasattr(pg_index, "refresh_ref_docs"):
-                    await asyncio.to_thread(pg_index.refresh_ref_docs, documents)  # type: ignore[attr-defined]
-                logger.info("🧠 Document added to Neo4j property graph.")
-        except Exception as e:
-            logger.warning(f"Graph ingestion skipped due to error: {e}")
+        # Neo4j graph persisted via Cypher; skip PropertyGraphIndex refresh to avoid async issues
+        logger.info("🧠 Document persisted to Neo4j via Cypher upsert.")
 
         # Emit Graphiti episode for the ingestion event (best-effort)
         try:
@@ -407,25 +459,40 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
 
         async def graph_task():
             try:
-                if pg_index is None:
+                if pg_index is None or neo4j_driver is None:
                     return None
-                pg_query_engine = pg_index.as_query_engine()
-                if hasattr(pg_query_engine, "aquery"):
-                    return await pg_query_engine.aquery(request.query)
-                # Run sync query in thread to avoid blocking loop
-                return await asyncio.to_thread(pg_query_engine.query, request.query)
+                # Cypher backed retrieval via fulltext on Page.text
+                cypher = (
+                    "CALL db.index.fulltext.queryNodes('pageTextIndex', $q) YIELD node, score "
+                    "RETURN node.text AS text, node.page AS page, score ORDER BY score DESC LIMIT 5"
+                )
+                def _run():
+                    with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                        res = session.run(cypher, q=request.query)
+                        rows = res.data()
+                        snippets = []
+                        for r in rows:
+                            p = r.get("page")
+                            t = r.get("text") or ""
+                            snippets.append(f"[p{p}] {t[:600]}")
+                        return "\n".join(snippets)
+                return await asyncio.to_thread(_run)
             except Exception as e:
                 logger.debug(f"Graph query skipped: {e}")
                 return None
 
         vector_resp, graph_resp = await asyncio.gather(vector_task(), graph_task())
-        if vector_resp is None or str(vector_resp).strip() == "":
+        if (vector_resp is None) or _is_empty_answer(vector_resp):
             # Fallback: ask LLM directly with minimal prompt if vector returns empty
             llm = Settings.llm
             direct_answer = await llm.acomplete(request.query)
             vector_resp = direct_answer.text if hasattr(direct_answer, 'text') else str(direct_answer)
         response = vector_resp
-        graph_snippets: List[str] = [str(graph_resp)] if graph_resp else []
+        graph_snippets: List[str] = []
+        if graph_resp:
+            _g = str(graph_resp).strip()
+            if _g and _g.lower() != "empty response":
+                graph_snippets.append(_g)
         
         sources: List[str] = []
         confidence: float = 0.0
@@ -442,8 +509,42 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
         logger.debug(f"📊 Confidence score: {confidence:.2f}")
 
         combined_answer = str(response)
+        if _is_empty_answer(combined_answer):
+            combined_answer = "No relevant content found in the document."
         if graph_snippets:
             combined_answer = combined_answer + "\n\n[Graph Insight]\n" + "\n".join(graph_snippets)
+
+        # If empty/placeholder, try to fetch a previous answer from Neo4j, then set a clear default
+        try:
+            if _is_empty_answer_text(combined_answer) and neo4j_driver is not None:
+                def _get_answer_from_neo4j(q: str) -> str:
+                    try:
+                        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                            rec = session.execute_read(
+                                lambda tx: tx.run(
+                                    """
+                                    MATCH (q:HackRxQuestion)-[:HAS_ANSWER]->(a:HackRxAnswer)
+                                    WHERE toLower(q.text) = toLower($q)
+                                       OR toLower(q.text) CONTAINS toLower($q)
+                                       OR toLower($q) CONTAINS toLower(q.text)
+                                    RETURN a.text AS text, coalesce(a.updatedAt, a.createdAt, 0) AS ts
+                                    ORDER BY ts DESC
+                                    LIMIT 1
+                                    """,
+                                    q=q,
+                                ).single()
+                            )
+                            return rec["text"] if rec and rec.get("text") else ""
+                    except Exception:
+                        return ""
+                prior = await asyncio.to_thread(_get_answer_from_neo4j, request.query)
+                if not _is_empty_answer_text(prior):
+                    combined_answer = prior
+        except Exception:
+            pass
+
+        if _is_empty_answer_text(combined_answer):
+            combined_answer = "No answer found."
 
         result = {
             "answer": combined_answer,
@@ -452,6 +553,30 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
             "reasoning": "Hybrid vector+graph retrieval with LlamaIndex.",
             "metadata": {}
         }
+
+        # Best-effort: persist Q&A to Neo4j
+        try:
+            if neo4j_driver is not None and not _is_empty_answer_text(combined_answer):
+                def _write_to_neo4j(q: str, a: str):
+                    with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                        session.execute_write(
+                            lambda tx: tx.run(
+                                """
+                                MERGE (q:HackRxQuestion {text: $q})
+                                ON CREATE SET q.firstSeenAt = timestamp()
+                                ON MATCH SET q.lastSeenAt = timestamp()
+                                MERGE (ans:HackRxAnswer {text: $a})
+                                ON CREATE SET ans.createdAt = timestamp()
+                                ON MATCH SET ans.updatedAt = timestamp()
+                                MERGE (q)-[r:HAS_ANSWER]->(ans)
+                                RETURN 1
+                                """,
+                                q=q, a=a,
+                            )
+                        )
+                await asyncio.to_thread(_write_to_neo4j, request.query, combined_answer)
+        except Exception as e:
+            logger.debug(f"Skipping Neo4j Q&A persist due to error: {e}")
 
         # Emit Graphiti episode for the query (best-effort)
         try:
@@ -507,10 +632,19 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
             raise HTTPException(status_code=500, detail=f"Error loading document from URL: {str(e)}")
     else:
         try:
-            index_stats = pc_client.Index(config.PINECONE_INDEX_NAME).describe_index_stats()
-            if index_stats.total_vector_count == 0:
+            index_stats_obj = pc_client.Index(config.PINECONE_INDEX_NAME).describe_index_stats()
+            # Normalize Pinecone stats to a dict and extract total_vector_count safely
+            if isinstance(index_stats_obj, dict):
+                total_vecs = int(index_stats_obj.get("total_vector_count", 0))
+            elif hasattr(index_stats_obj, "to_dict"):
+                total_vecs = int(index_stats_obj.to_dict().get("total_vector_count", 0))
+            elif hasattr(index_stats_obj, "model_dump"):
+                total_vecs = int(index_stats_obj.model_dump().get("total_vector_count", 0))
+            else:
+                total_vecs = 0
+            if total_vecs == 0:
                 raise HTTPException(status_code=404, detail="No document index available. Please use the 'documents' field to provide a URL for a document to be indexed.")
-            logger.info(f"📂 Using existing document index with {index_stats.total_vector_count} vectors.")
+            logger.info(f"📂 Using existing document index with {total_vecs} vectors.")
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"Could not connect to Pinecone index: {str(e)}")
 
@@ -531,15 +665,104 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
 
     query_engine = index.as_query_engine(
         similarity_top_k=max(3, config.TOP_K_RESULTS),
-        response_mode="compact"
+        response_mode="compact",
+        node_postprocessors=[LongContextReorder()],
     )
 
     async def process_single_question(question: str):
         logger.info(f"  - Starting query for question: '{question}'")
+
+        async def vector_task():
+            try:
+                return await query_engine.aquery(question)
+            except Exception as e:
+                logger.error(f"Vector query failed: {e}")
+                return None
+
+        async def graph_task():
+            try:
+                if pg_index is None:
+                    return None
+                pg_query_engine = pg_index.as_query_engine()
+                return await asyncio.to_thread(pg_query_engine.query, question)
+            except Exception as e:
+                logger.debug(f"Graph query skipped: {e}")
+                return None
+
+        def _get_answer_from_neo4j(q: str) -> str:
+            if neo4j_driver is None:
+                return ""
+            try:
+                with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                    rec = session.execute_read(
+                        lambda tx: tx.run(
+                            """
+                            MATCH (q:HackRxQuestion)-[:HAS_ANSWER]->(a:HackRxAnswer)
+                            WHERE toLower(q.text) = toLower($q)
+                               OR toLower(q.text) CONTAINS toLower($q)
+                               OR toLower($q) CONTAINS toLower(q.text)
+                            RETURN a.text AS text, coalesce(a.updatedAt, a.createdAt, 0) AS ts
+                            ORDER BY ts DESC
+                            LIMIT 1
+                            """,
+                            q=q,
+                        ).single()
+                    )
+                    return rec["text"] if rec and rec.get("text") else ""
+            except Exception:
+                return ""
+
         try:
-            response = await query_engine.aquery(question)
+            vector_resp, graph_resp = await asyncio.gather(vector_task(), graph_task())
+
+            # Fallback to a direct LLM completion if vector is empty
+            if vector_resp is None or str(vector_resp).strip() == "":
+                try:
+                    llm = Settings.llm
+                    direct_answer = await llm.acomplete(question)
+                    vector_resp = direct_answer.text if hasattr(direct_answer, "text") else str(direct_answer)
+                except Exception as e:
+                    logger.error(f"Direct LLM fallback failed: {e}")
+                    vector_resp = ""
+
+            combined = str(vector_resp) if vector_resp is not None else ""
+            if graph_resp:
+                combined = (combined + "\n\n[Graph Insight]\n" + str(graph_resp)).strip()
+
+            # If still empty/placeholder, try retrieving a previously saved answer from Neo4j
+            if _is_empty_answer_text(combined):
+                prior = await asyncio.to_thread(_get_answer_from_neo4j, question)
+                if not _is_empty_answer_text(prior):
+                    combined = prior
+            if _is_empty_answer_text(combined):
+                combined = "No answer found."
+
+            # Best-effort: persist Q&A to Neo4j for later retrieval
+            try:
+                if neo4j_driver is not None and not _is_empty_answer_text(combined):
+                    def _write_to_neo4j(q: str, a: str):
+                        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                            session.execute_write(
+                                lambda tx: tx.run(
+                                    """
+                                    MERGE (q:HackRxQuestion {text: $q})
+                                    ON CREATE SET q.firstSeenAt = timestamp()
+                                    ON MATCH SET q.lastSeenAt = timestamp()
+                                    MERGE (ans:HackRxAnswer {text: $a})
+                                    ON CREATE SET ans.createdAt = timestamp()
+                                    ON MATCH SET ans.updatedAt = timestamp()
+                                    MERGE (q)-[r:HAS_ANSWER]->(ans)
+                                    RETURN 1
+                                    """,
+                                    q=q, a=a,
+                                )
+                            )
+                    await asyncio.to_thread(_write_to_neo4j, question, combined)
+            except Exception as e:
+                logger.debug(f"Skipping Neo4j Q&A persist due to error: {e}")
+
             logger.info(f"  - Finished query for question: '{question}'")
-            return str(response)
+            return combined
         except Exception as e:
             logger.error(f"  - Failed to process question '{question}': {e}")
             return "Error processing this question."
