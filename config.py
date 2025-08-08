@@ -21,6 +21,20 @@ class Config:
     CHUNK_SIZE: int = 1200 
     CHUNK_OVERLAP: int = 300
     TOP_K_RESULTS: int = 6
+
+    # Neo4j Graph configuration
+    NEO4J_URI: str = os.getenv("NEO4J_URI", "neo4j://localhost:7687")
+    NEO4J_USERNAME: str = os.getenv("NEO4J_USERNAME", "neo4j")
+    NEO4J_PASSWORD: str = os.getenv("NEO4J_PASSWORD", "password")
+    NEO4J_DATABASE: str = os.getenv("NEO4J_DATABASE", "neo4j")
+    ENABLE_GRAPH_STORE: bool = os.getenv("ENABLE_GRAPH_STORE", "false").lower() in {"1", "true", "yes"}
+
+    # Graphiti sidecar (episodes) configuration
+    GRAPHITI_ENABLED: bool = os.getenv("GRAPHITI_ENABLED", "false").lower() in {"1", "true", "yes"}
+    GRAPHITI_SERVER_URL: str = os.getenv("GRAPHITI_SERVER_URL", "")
+    GRAPHITI_API_KEY: str = os.getenv("GRAPHITI_API_KEY", "")
+    GRAPHITI_WORKSPACE: str = os.getenv("GRAPHITI_WORKSPACE", "default")
+    GRAPHITI_EPISODE_DIR: str = os.getenv("GRAPHITI_EPISODE_DIR", "./graphiti_episodes")
     
     @classmethod
     def validate(cls) -> None:
@@ -30,5 +44,14 @@ class Config:
             raise ValueError("PINECONE_API_KEY is not set. Please set the environment variable or update the config.py file.")
         if not cls.PINECONE_ENVIRONMENT or cls.PINECONE_ENVIRONMENT == "YOUR_PINECONE_ENVIRONMENT_HERE":
             raise ValueError("PINECONE_ENVIRONMENT is not set. Please set the environment variable or update the config.py file.")
+        if not cls.NEO4J_URI:
+            raise ValueError("NEO4J_URI is not set. Please set the environment variable or update the config.py file.")
+        if not cls.NEO4J_USERNAME:
+            raise ValueError("NEO4J_USERNAME is not set. Please set the environment variable or update the config.py file.")
+        if not cls.NEO4J_PASSWORD or cls.NEO4J_PASSWORD == "password":
+            raise ValueError("NEO4J_PASSWORD is not set. Please set the environment variable or update the config.py file.")
+        # Graphiti optional; validate minimally if enabled
+        if cls.GRAPHITI_ENABLED and not cls.GRAPHITI_SERVER_URL:
+            raise ValueError("GRAPHITI_SERVER_URL must be set when GRAPHITI_ENABLED=true")
 
 config = Config()

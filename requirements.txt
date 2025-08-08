@@ -7,15 +7,18 @@ requests
 # Document Processing & RAG Pipeline
 PyMuPDF
 tabulate
-pypdf # For PDF handling
 python-docx
 llama-index-core
 llama-index-llms-openai
 llama-index-embeddings-openai
 llama-index-vector-stores-pinecone
+llama-index-graph-stores-neo4j
 pinecone-client
 openai
 tiktoken # Used by OpenAI models for token counting
+neo4j
+httpx
+tenacity
 
 # Utility & Deployment (Optional but recommended)
 python-dotenv

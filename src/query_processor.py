@@ -3,6 +3,7 @@ import logging
 from typing import Dict, Any, Optional, List
 from dataclasses import dataclass
 from openai import OpenAI, AsyncOpenAI
+from typing import Tuple
 
 from config import config
 
@@ -35,24 +36,28 @@ class QueryProcessor:
         """Use LLM to perform a universal query analysis and extraction."""
         try:
             prompt = f"""
-            Analyze the following query and extract structured information. The query could be about any document (e.g., policy, contract, legal text, HR handbook).
+You are an enterprise-grade information extraction engine assisting a Retrieval-Augmented Generation (RAG) system. The user may ask about any domain (medicine, law, finance, engineering, science, HR, compliance, contracts, manuals, academic PDFs, etc.). Extract structured intent and entities with high recall and precision, avoiding speculation.
 
-            Query: "{query}"
+User Query: "{query}"
 
-            Please extract and return a JSON object with the following fields:
-            - key_entities: list of main subjects or concepts (e.g., 'knee surgery', 'maternity', 'contract termination').
-            - constraints: A dictionary of key-value pairs representing conditions or limitations. Identify any dates, durations, amounts, locations, or specific requirements. For a query like "46-year-old male, Pune, 3-month-old policy," constraints would be {{'age': 46, 'gender': 'male', 'location': 'Pune', 'policy_duration': '3 months'}}.
-            - query_type: A single label describing the user's intent, such as "coverage_check", "amount_inquiry", "eligibility_check", "definition_lookup", "procedure_guide", or "general_inquiry".
-            - confidence: a confidence score (0-1) for the extraction.
+Return ONLY a compact JSON object with these fields:
+- key_entities: Array of the main subjects/concepts/terms of art. Use canonical forms when possible.
+- constraints: Object mapping constraint names to normalized values. Include dates (ISO 8601 if present), quantities (with units), locations, demographic attributes, policy/section/article references, statutes, formulas, or any explicit qualifiers.
+- query_type: One of [coverage_check, amount_inquiry, eligibility_check, definition_lookup, procedure_guide, comparison, calculation, legal_citation, safety_compliance, general_inquiry]. Choose the closest.
+- domain_hint: Short string with likely domain (e.g., "health_insurance", "contract_law", "civil_engineering", "pharmacology", "physics", "finance", "hr_policy", "research_article", "manual").
+- confidence: Float between 0 and 1 reflecting extraction confidence.
 
-            Return only the JSON object, no additional text or conversational phrases.
-            """
+Notes:
+- Be conservative; do not invent facts.
+- Normalize numbers and units where explicit.
+- Include section/page references if present in the query.
+"""
             
             response = await async_llm_client.chat.completions.create(
                 model=config.OPENAI_MODEL,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.1,
-                max_tokens=500
+                max_tokens=300
             )
             
             import json
@@ -132,11 +137,18 @@ class QueryProcessor:
         
         # Dynamically generate search queries from the LLM's output
         search_queries = self.create_search_queries(query, enhanced_result)
-        
+        # Also return a light-weight list of entity pairs that can be used for graph hints
+        entity_pairs: List[Tuple[str, str]] = []
+        entities = enhanced_result.get('key_entities', []) or []
+        if len(entities) >= 2:
+            for i in range(len(entities) - 1):
+                entity_pairs.append((entities[i], entities[i + 1]))
+
         return {
             "original_query": query,
             "enhanced_extraction": enhanced_result,
             "search_queries": search_queries,
+            "graph_hints": entity_pairs,
             "processing_metadata": {
                 "method": "llm-driven",
                 "confidence": enhanced_result.get("confidence", 0.7)

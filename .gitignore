@@ -9,6 +9,10 @@ venv/
 
 # Environment variables
 .env
+.env.local
+
+# Graphiti local episode cache
+graphiti_episodes/
 
 # FAISS index files (large ML model files)
 data/faiss_index.faiss

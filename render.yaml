@@ -9,3 +9,29 @@ services:
         value: 3.12.6
       - key: PORT
         value: 8000
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: PINECONE_API_KEY
+        sync: false
+      - key: PINECONE_ENVIRONMENT
+        sync: false
+      - key: PINECONE_INDEX_NAME
+        value: policy-index
+      - key: NEO4J_URI
+        sync: false
+      - key: NEO4J_USERNAME
+        value: neo4j
+      - key: NEO4J_PASSWORD
+        sync: false
+      - key: NEO4J_DATABASE
+        value: neo4j
+      - key: GRAPHITI_ENABLED
+        value: "false"
+      - key: GRAPHITI_SERVER_URL
+        sync: false
+      - key: GRAPHITI_API_KEY
+        sync: false
+      - key: GRAPHITI_WORKSPACE
+        value: default
+      - key: GRAPHITI_EPISODE_DIR
+        value: ./graphiti_episodes

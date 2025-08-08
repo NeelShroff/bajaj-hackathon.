@@ -32,10 +32,17 @@ from llama_index.core.storage.storage_context import StorageContext
 from llama_index.core.node_parser import SentenceSplitter
 from llama_index.embeddings.openai import OpenAIEmbedding
 from llama_index.vector_stores.pinecone import PineconeVectorStore
+from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
+from llama_index.core.storage.storage_context import StorageContext
+from llama_index.core import PropertyGraphIndex
+from llama_index.core.ingestion import IngestionPipeline
 from pinecone import Pinecone
-import PyPDF2
+import fitz  # PyMuPDF
 from llama_index.llms.openai import OpenAI
 from llama_index.core.schema import Document
+from llama_index.core.postprocessor import LongContextReorder
+from neo4j import GraphDatabase
+from src.graphiti_client import GraphitiClient
 
 # Configure logging
 logging.basicConfig(
@@ -60,8 +67,11 @@ class HackRxResponse(BaseModel):
 query_processor: QueryProcessor = QueryProcessor()
 pipeline: Optional[IngestionPipeline] = None
 index: Optional[VectorStoreIndex] = None
+pg_index: Optional[PropertyGraphIndex] = None
+neo4j_driver = None
 executor = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 pc_client = Pinecone(api_key=config.PINECONE_API_KEY)
+graphiti_client = GraphitiClient()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -69,7 +79,7 @@ async def lifespan(app: FastAPI):
     Handles startup and shutdown events for the application.
     This replaces the deprecated @app.on_event("startup") and "shutdown" decorators.
     """
-    global index, pipeline
+    global index, pipeline, pg_index, neo4j_driver
     logger.info("🚀 System initialization started on startup.")
     Settings.embed_model = OpenAIEmbedding(model=config.EMBEDDING_MODEL)
     Settings.llm = OpenAI(model=config.OPENAI_MODEL)
@@ -99,6 +109,35 @@ async def lifespan(app: FastAPI):
         storage_context = StorageContext.from_defaults(vector_store=pinecone_vector_store)
         index = VectorStoreIndex([], storage_context=storage_context, show_progress=True)
         
+        # Initialize Neo4j graph store and property graph index
+        try:
+            # Initialize low-level driver for health checks
+            neo4j_driver = GraphDatabase.driver(
+                config.NEO4J_URI,
+                auth=(config.NEO4J_USERNAME, config.NEO4J_PASSWORD),
+            )
+            try:
+                neo4j_driver.verify_connectivity()
+                logger.info("✅ Neo4j connectivity verified.")
+            except Exception as e:
+                logger.warning(f"Neo4j connectivity check failed: {e}")
+
+            graph_store = Neo4jPropertyGraphStore(
+                username=config.NEO4J_USERNAME,
+                password=config.NEO4J_PASSWORD,
+                url=config.NEO4J_URI,
+                database=config.NEO4J_DATABASE,
+            )
+            pg_index = PropertyGraphIndex.from_documents(
+                documents=[],
+                property_graph_store=graph_store,
+                embed_model=Settings.embed_model,
+                show_progress=False,
+            )
+            logger.info("✨ Neo4j graph store initialized.")
+        except Exception as e:
+            logger.error(f"❌ Failed to initialize Neo4j graph store: {e}")
+
         pipeline = IngestionPipeline(
             transformations=[
                 SentenceSplitter(chunk_size=config.CHUNK_SIZE, chunk_overlap=config.CHUNK_OVERLAP),
@@ -115,6 +154,13 @@ async def lifespan(app: FastAPI):
         logger.info("🛑 Shutting down thread pool executor...")
         executor.shutdown(wait=True)
         logger.info("🛑 Thread pool executor shut down.")
+        # Close Neo4j driver
+        try:
+            if neo4j_driver is not None:
+                neo4j_driver.close()
+                logger.info("🛑 Neo4j driver closed.")
+        except Exception:
+            pass
 
 app = FastAPI(
     title="LLM Document Processing System",
@@ -153,8 +199,19 @@ async def health_check():
     try:
         index_stats = pc_client.Index(config.PINECONE_INDEX_NAME).describe_index_stats()
         is_healthy = index_stats.status['ready']
+        # Neo4j health
+        neo4j_ok = False
+        try:
+            if neo4j_driver is not None:
+                with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                    result = session.run("RETURN 1 as ok").single()
+                    neo4j_ok = bool(result and result["ok"] == 1)
+        except Exception as e:
+            logger.warning(f"Neo4j health check failed: {e}")
+
         components = {
             'pinecone_index': is_healthy,
+            'neo4j': neo4j_ok,
             'openai_api': True
         }
         if not is_healthy:
@@ -175,22 +232,18 @@ async def health_check():
 
 async def _process_pdf_page(file_path: str, page_num: int) -> str:
     """Helper function to extract text from a single PDF page concurrently."""
-    return await asyncio.to_thread(_thread_process_pdf_page_with_pypdf2, file_path, page_num)
+    return await asyncio.to_thread(_thread_process_pdf_page_with_pymupdf_first, file_path, page_num)
 
-def _thread_process_pdf_page_with_pypdf2(file_path: str, page_num: int) -> str:
-    """Synchronous function for PyPDF2 text extraction to be run in a thread pool."""
-    try:
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            page = reader.pages[page_num]
-            return page.extract_text() or ""
-    except Exception as e:
-        logger.warning(f"PyPDF2 extraction failed for page {page_num}: {e}")
-        return ""
+def _thread_process_pdf_page_with_pymupdf_first(file_path: str, page_num: int) -> str:
+    """Synchronous function using PyMuPDF for fast, accurate text extraction."""
+    with fitz.open(file_path) as pdf_doc:
+        page = pdf_doc.load_page(page_num)
+        text = page.get_text("text")
+        return text or ""
 
 async def _load_and_index_from_url(document_url: str):
     """Helper function to load and index a document from a URL using LlamaIndex with optimizations."""
-    global index, pipeline
+    global index, pipeline, pg_index
     if not pipeline:
          raise RuntimeError("Ingestion pipeline is not initialized.")
     logger.info(f"🌐 Downloading document from URL: {document_url}")
@@ -206,9 +259,8 @@ async def _load_and_index_from_url(document_url: str):
         logger.info(f"📁 Document downloaded in {time.time() - start_download:.2f}s.")
         
         start_processing = time.time()
-        with open(temp_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            num_pages = len(reader.pages)
+        with fitz.open(str(temp_path)) as pdf_doc:
+            num_pages = pdf_doc.page_count
         
         logger.info(f"⚙️ Starting parallel text extraction for {num_pages} pages...")
         processing_tasks = [_process_pdf_page(str(temp_path), i) for i in range(num_pages)]
@@ -217,7 +269,14 @@ async def _load_and_index_from_url(document_url: str):
         full_text = "\n".join(pages_content)
         logger.info(f"✅ Text extraction completed in {time.time() - start_processing:.2f}s. Total characters extracted: {len(full_text)}")
 
-        documents = [Document(text=full_text, metadata={"source": document_url})]
+        # Create page-level documents for better citations and graph nodes
+        documents = []
+        for i, page_text in enumerate(pages_content):
+            if not page_text:
+                continue
+            documents.append(
+                Document(text=page_text, metadata={"source": document_url, "page": i + 1})
+            )
         
         start_ingestion = time.time()
         logger.info("📦 Starting LlamaIndex ingestion pipeline...")
@@ -232,6 +291,29 @@ async def _load_and_index_from_url(document_url: str):
         )
         storage_context = StorageContext.from_defaults(vector_store=pinecone_vector_store)
         index = VectorStoreIndex.from_vector_store(pinecone_vector_store, storage_context=storage_context)
+
+        # Also upsert into the property graph for schema-rich retrieval (best-effort)
+        try:
+            if pg_index is not None:
+                pg_index.refresh_ref_docs(documents)
+                logger.info("🧠 Document added to Neo4j property graph.")
+        except Exception as e:
+            logger.warning(f"Graph ingestion skipped due to error: {e}")
+
+        # Emit Graphiti episode for the ingestion event (best-effort)
+        try:
+            await graphiti_client.send_episode(
+                title="document_ingested",
+                content=f"{document_url}",
+                metadata={
+                    "type": "pdf_ingestion",
+                    "pages": len(pages_content),
+                    "chunks": len(documents),
+                    "source": document_url,
+                },
+            )
+        except Exception as e:
+            logger.debug(f"Graphiti episode write failed: {e}")
         
         index_stats = pc_client.Index(config.PINECONE_INDEX_NAME).describe_index_stats()
         logger.info(f"🎉 Successfully loaded and indexed document. Total vectors: {index_stats.total_vector_count}")
@@ -277,11 +359,30 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
     
     query_engine = index.as_query_engine(
         similarity_top_k=config.TOP_K_RESULTS,
-        response_mode="compact"
+        response_mode="compact",
+        node_postprocessors=[LongContextReorder()]
     )
 
     try:
-        response = await query_engine.aquery(request.query)
+        async def vector_task():
+            return await query_engine.aquery(request.query)
+
+        async def graph_task():
+            try:
+                if pg_index is None:
+                    return None
+                pg_query_engine = pg_index.as_query_engine()
+                if hasattr(pg_query_engine, "aquery"):
+                    return await pg_query_engine.aquery(request.query)
+                # Run sync query in thread to avoid blocking loop
+                return await asyncio.to_thread(pg_query_engine.query, request.query)
+            except Exception as e:
+                logger.debug(f"Graph query skipped: {e}")
+                return None
+
+        vector_resp, graph_resp = await asyncio.gather(vector_task(), graph_task())
+        response = vector_resp
+        graph_snippets: List[str] = [str(graph_resp)] if graph_resp else []
         
         source_nodes = response.source_nodes
         sources = [node.metadata.get('source', 'Unknown') for node in source_nodes]
@@ -292,16 +393,54 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
         logger.debug(f"🔍 Sources found: {sources}")
         logger.debug(f"📊 Confidence score: {confidence:.2f}")
 
-        return {
-            "answer": str(response),
+        combined_answer = str(response)
+        if graph_snippets:
+            combined_answer = combined_answer + "\n\n[Graph Insight]\n" + "\n".join(graph_snippets)
+
+        result = {
+            "answer": combined_answer,
             "confidence": confidence,
             "sources": sources,
-            "reasoning": "Answer generated from retrieved context by LlamaIndex.",
+            "reasoning": "Hybrid vector+graph retrieval with LlamaIndex.",
             "metadata": {}
         }
+
+        # Emit Graphiti episode for the query (best-effort)
+        try:
+            await graphiti_client.send_episode(
+                title="query",
+                content=request.query,
+                metadata={
+                    "sources": sources,
+                    "confidence": confidence,
+                    "has_graph": bool(graph_snippets),
+                },
+            )
+        except Exception as e:
+            logger.debug(f"Graphiti episode write failed: {e}")
+
+        return result
     except Exception as e:
         logger.error(f"❌ Error processing query: {e}")
         raise HTTPException(status_code=500, detail=f"Query processing failed: {str(e)}")
+
+class GraphQueryRequest(BaseModel):
+    query: str
+
+@app.post("/graph/query", tags=["Querying"])
+async def graph_query(request: GraphQueryRequest, token: str = Depends(verify_token)) -> Dict[str, Any]:
+    """Runs a graph-only query using the property graph index (Neo4j)."""
+    if pg_index is None:
+        raise HTTPException(status_code=503, detail="Graph index not available.")
+    try:
+        pg_query_engine = pg_index.as_query_engine()
+        if hasattr(pg_query_engine, "aquery"):
+            resp = await pg_query_engine.aquery(request.query)
+        else:
+            resp = await asyncio.to_thread(pg_query_engine.query, request.query)
+        return {"answer": str(resp)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Graph query failed: {str(e)}")
 
 @app.post("/api/v1/hackrx/run", tags=["Hackathon"])
 async def process_batch_queries(request: BatchQueryRequest, token: str = Depends(verify_token)) -> HackRxResponse:
