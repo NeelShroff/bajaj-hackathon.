@@ -197,8 +197,21 @@ async def root():
 @app.get("/health")
 async def health_check():
     try:
-        index_stats = pc_client.Index(config.PINECONE_INDEX_NAME).describe_index_stats()
-        is_healthy = index_stats.status['ready']
+        # Pinecone stats (v3 returns a dict)
+        pinecone_index = pc_client.Index(config.PINECONE_INDEX_NAME)
+        stats_obj = pinecone_index.describe_index_stats()
+        # Normalize to plain dict if needed
+        if isinstance(stats_obj, dict):
+            stats = stats_obj
+        elif hasattr(stats_obj, "to_dict"):
+            stats = stats_obj.to_dict()
+        elif hasattr(stats_obj, "model_dump"):
+            stats = stats_obj.model_dump()
+        else:
+            stats = {}
+        document_count = int(stats.get('total_vector_count', 0)) if isinstance(stats, dict) else 0
+        is_healthy = True  # If stats call succeeds, treat as healthy
+
         # Neo4j health
         neo4j_ok = False
         try:
@@ -210,21 +223,18 @@ async def health_check():
             logger.warning(f"Neo4j health check failed: {e}")
 
         components = {
-            'pinecone_index': is_healthy,
+            'pinecone_index': True,
             'neo4j': neo4j_ok,
             'openai_api': True
         }
-        if not is_healthy:
-            logger.warning("⚠️ Pinecone index is not ready.")
 
         system_status = {
             'is_healthy': is_healthy,
             'components': components,
-            'index_stats': index_stats.status,
-            'document_count': index_stats.total_vector_count
+            'document_count': document_count
         }
         
-        logger.info(f"💚 Health check completed. Status: {'Healthy' if is_healthy else 'Unhealthy'}")
+        logger.info("💚 Health check completed.")
         return system_status
     except Exception as e:
         logger.error(f"❌ Health check failed: {e}")
