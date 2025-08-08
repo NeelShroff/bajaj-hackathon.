@@ -135,7 +135,7 @@ security = HTTPBearer(auto_error=False)
 
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Security(security)):
     """Verify Bearer token authentication."""
-    SECRET_TOKEN = "52e10e56bc55ec56dd26783ea2cef3196cf8f7c6354a5b39d872559874bd29a5"
+    SECRET_TOKEN = "f9e29d7edca43a3e09b4f1c925d7efed93cc349767454bfbb423db67e29741b2"
     if not credentials or credentials.credentials != SECRET_TOKEN:
         raise HTTPException(status_code=401, detail="Invalid or missing authentication token")
     return credentials.credentials
@@ -363,11 +363,11 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
     
 if __name__ == "__main__":
     # Use the PORT environment variable if available, otherwise default to 8000
-    port = int(os.environ.get("PORT", 8000))
+    
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
-        port=port,
+        port=8000,
         reload=False,  # Disable reload in production
         log_level=config.LOG_LEVEL.lower()
     )
