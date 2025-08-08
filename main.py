@@ -12,6 +12,7 @@ import tempfile
 import asyncio
 import uvicorn
 import time
+import json
 import inspect
 from typing import Optional, List, Dict, Any
 from fastapi import FastAPI, HTTPException, UploadFile, File, Depends, Security
@@ -299,6 +300,113 @@ def _neo4j_upsert_pages(source_url: str, pages: List[Document]) -> None:
     except Exception as e:
         logger.warning(f"Neo4j upsert pages failed: {e}")
 
+
+# --------- LLM-driven KG extraction (entities + relations) ---------
+def _sanitize_label(raw: str) -> str:
+    s = ''.join(ch if ch.isalnum() or ch in ['_'] else '_' for ch in (raw or 'Entity'))
+    if not s:
+        return 'Entity'
+    return s
+
+def _safe_json(text: str) -> Dict[str, Any]:
+    if not text:
+        return {}
+    s = text.strip()
+    if s.startswith('```'):  # strip fences
+        s = s.strip('`')
+        if s.startswith('json'):
+            s = s[4:]
+    s = s.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        return {}
+
+async def _llm_extract_graph_for_page(page_text: str, source: str, page_num: int) -> Dict[str, Any]:
+    """Ask the LLM to extract entities and relationships for a page."""
+    if not page_text or len(page_text) < 40:
+        return {}
+    # Trim to avoid huge prompts
+    snippet = page_text[:3500]
+    prompt = f"""
+You are a precise information extraction system. From the page content below, extract a small knowledge graph.
+Return ONLY JSON with keys: nodes, edges.
+
+Schema:
+- nodes: Array of objects with fields: name (string), type (string), properties (object, optional)
+- edges: Array of objects with fields: source (string: node.name), target (string: node.name), relation (string), properties (object, optional)
+
+Rules:
+- Use concise canonical names; do not hallucinate.
+- Only include edges present explicitly on this page.
+- Limit to at most 10 nodes and 20 edges per page.
+
+Page meta: source={source}, page={page_num}
+Page text:
+"""
+    prompt += snippet
+    llm = Settings.llm
+    resp = await llm.acomplete(prompt)
+    content = getattr(resp, 'text', str(resp))
+    return _safe_json(content)
+
+def _upsert_graph_json(graph: Dict[str, Any], source: str, page_num: int) -> None:
+    if not graph or neo4j_driver is None:
+        return
+    nodes = graph.get('nodes') or []
+    edges = graph.get('edges') or []
+    try:
+        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+            # Upsert nodes
+            for n in nodes:
+                name = str(n.get('name', '')).strip()
+                ntype = str(n.get('type', 'Entity')).strip() or 'Entity'
+                props = n.get('properties') or {}
+                if not name:
+                    continue
+                label = _sanitize_label(ntype)
+                cy = (
+                    f"MERGE (e:Entity:`{label}` {{source:$source, name:$name, type:$type}}) "
+                    f"ON CREATE SET e.firstSeenAt=timestamp() "
+                    f"SET e.lastSeenAt=timestamp(), e += $props "
+                    f"WITH e "
+                    f"MERGE (p:Page {{source:$source, page:$page}}) "
+                    f"MERGE (e)-[:MENTIONED_IN]->(p)"
+                )
+                session.run(cy, source=source, name=name, type=ntype, props=props, page=page_num)
+            # Upsert edges
+            for e in edges:
+                sname = str(e.get('source', '')).strip()
+                tname = str(e.get('target', '')).strip()
+                rel = _sanitize_label(str(e.get('relation', 'RELATED_TO')) or 'RELATED_TO')
+                eprops = e.get('properties') or {}
+                if not sname or not tname:
+                    continue
+                cy = (
+                    "MATCH (a:Entity {source:$source, name:$sname}), (b:Entity {source:$source, name:$tname}) "
+                    f"MERGE (a)-[r:`{rel}` {{source:$source}}]->(b) "
+                    "SET r += $props"
+                )
+                session.run(cy, source=source, sname=sname, tname=tname, props=eprops)
+    except Exception as e:
+        logger.warning(f"Neo4j upsert KG failed: {e}")
+
+async def _extract_and_upsert_graph(documents: List[Document], source: str) -> None:
+    # Process a subset to avoid long runtimes; adjust if needed
+    max_pages = min(len(documents), 40)
+    tasks = []
+    for i in range(max_pages):
+        d = documents[i]
+        page_num = int(d.metadata.get('page', i + 1)) if d.metadata else (i + 1)
+        tasks.append(_llm_extract_graph_for_page(d.text, source, page_num))
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for i, res in enumerate(results):
+        if isinstance(res, Exception):
+            logger.debug(f"KG extract skip page {i+1}: {res}")
+            continue
+        page_num = int(documents[i].metadata.get('page', i + 1)) if documents[i].metadata else (i + 1)
+        _upsert_graph_json(res, source, page_num)
+
 async def _process_pdf_page(file_path: str, page_num: int) -> str:
     """Helper function to extract text from a single PDF page concurrently."""
     return await asyncio.to_thread(_thread_process_pdf_page_with_pymupdf_first, file_path, page_num)
@@ -349,6 +457,12 @@ async def _load_and_index_from_url(document_url: str):
         # Persist in Neo4j synchronously to guarantee graph availability
         _neo4j_ensure_indexes()
         _neo4j_upsert_pages(document_url, documents)
+        # Extract higher-level nodes/relations from each page (LLM) and upsert to Neo4j
+        try:
+            await _extract_and_upsert_graph(documents, document_url)
+            logger.info("🧩 LLM-driven KG extracted and stored in Neo4j.")
+        except Exception as e:
+            logger.warning(f"KG extraction skipped: {e}")
         
         start_ingestion = time.time()
         logger.info("📦 Starting LlamaIndex ingestion pipeline...")
@@ -461,21 +575,37 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
             try:
                 if pg_index is None or neo4j_driver is None:
                     return None
-                # Cypher backed retrieval via fulltext on Page.text
-                cypher = (
+                # 1) Retrieve high-signal entity edges for reasoning
+                cypher_entities = (
+                    "MATCH (e:Entity {source:$source})-[:MENTIONED_IN]->(p:Page {source:$source}) "
+                    "WHERE e.name CONTAINS $kw OR e.type CONTAINS $kw "
+                    "RETURN e.name AS name, e.type AS type, p.page AS page LIMIT 10"
+                )
+                # 2) Retrieve page text snippets using fulltext
+                cypher_pages = (
                     "CALL db.index.fulltext.queryNodes('pageTextIndex', $q) YIELD node, score "
                     "RETURN node.text AS text, node.page AS page, score ORDER BY score DESC LIMIT 5"
                 )
                 def _run():
                     with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
-                        res = session.run(cypher, q=request.query)
-                        rows = res.data()
-                        snippets = []
-                        for r in rows:
-                            p = r.get("page")
-                            t = r.get("text") or ""
-                            snippets.append(f"[p{p}] {t[:600]}")
-                        return "\n".join(snippets)
+                        # Try to scope by last ingested source if available via Document node
+                        # Fallback: any source (first doc)
+                        source = session.run("MATCH (d:Document) RETURN d.source AS s LIMIT 1").single()
+                        s_val = source["s"] if source else ""
+                        ent_rows = session.run(cypher_entities, source=s_val, kw=request.query).data()
+                        page_rows = session.run(cypher_pages, q=request.query).data()
+                        parts = []
+                        if ent_rows:
+                            parts.append("[Graph Entities]")
+                            for r in ent_rows:
+                                parts.append(f"- {r.get('name')} ({r.get('type')}) p{r.get('page')}")
+                        if page_rows:
+                            parts.append("[Graph Pages]")
+                            for r in page_rows:
+                                p = r.get('page')
+                                t = (r.get('text') or '')[:600]
+                                parts.append(f"[p{p}] {t}")
+                        return "\n".join(parts)
                 return await asyncio.to_thread(_run)
             except Exception as e:
                 logger.debug(f"Graph query skipped: {e}")
