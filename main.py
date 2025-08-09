@@ -273,7 +273,7 @@ async def lifespan(app: FastAPI):
             neo4j_driver = None
             neo4j_pg_store = None
             pg_index = None
-
+        
         pipeline = IngestionPipeline(
             transformations=[
                 SentenceSplitter(chunk_size=config.CHUNK_SIZE, chunk_overlap=config.CHUNK_OVERLAP),
@@ -582,6 +582,72 @@ Page text:
         logger.error(f"Failed to extract graph for page {page_num}: {e}")
         return {"nodes": [], "edges": []}
 
+async def _create_entity_embeddings(entities: List[Dict[str, Any]], source: str) -> None:
+    """Create and store vector embeddings for entities to enable fast retrieval."""
+    if not entities or neo4j_driver is None:
+        return
+    
+    try:
+        # Create embeddings for entity names and types
+        embedding_model = Settings.embed_model
+        
+        for entity in entities:
+            name = str(entity.get('name', '')).strip()
+            entity_type = str(entity.get('type', '')).strip()
+            
+            if not name:
+                continue
+            
+            # Create embedding for entity name + type
+            entity_text = f"{name} {entity_type}".strip()
+            if len(entity_text) > 10:  # Only embed meaningful entities
+                try:
+                    embedding = await embedding_model.aget_text_embedding(entity_text)
+                    
+                    # Store embedding in Neo4j
+                    with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                        session.run(
+                            """
+                            MATCH (e:Entity {source: $source, name: $name, type: $type})
+                            SET e.embedding = $embedding, e.embedding_text = $embedding_text
+                            """,
+                            source=source, name=name, type=entity_type, 
+                            embedding=embedding, embedding_text=entity_text
+                        )
+                except Exception as e:
+                    logger.debug(f"Failed to create embedding for entity {name}: {e}")
+                    
+    except Exception as e:
+        logger.warning(f"Entity embedding creation failed: {e}")
+
+async def _create_keyword_embeddings(keywords: List[str], source: str) -> None:
+    """Create and store vector embeddings for important keywords."""
+    if not keywords or neo4j_driver is None:
+        return
+    
+    try:
+        embedding_model = Settings.embed_model
+        
+        for keyword in keywords:
+            if len(keyword.strip()) > 3:  # Only embed meaningful keywords
+                try:
+                    embedding = await embedding_model.aget_text_embedding(keyword.strip())
+                    
+                    # Store keyword embedding in Neo4j
+                    with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                        session.run(
+                            """
+                            MERGE (k:Keyword {source: $source, text: $keyword})
+                            SET k.embedding = $embedding, k.created_at = timestamp()
+                            """,
+                            source=source, keyword=keyword.strip(), embedding=embedding
+                        )
+                except Exception as e:
+                    logger.debug(f"Failed to create embedding for keyword {keyword}: {e}")
+                    
+    except Exception as e:
+        logger.warning(f"Keyword embedding creation failed: {e}")
+
 def _upsert_graph_json(graph: Dict[str, Any], source: str, page_num: int) -> None:
     if not graph or neo4j_driver is None:
         return
@@ -690,6 +756,9 @@ async def _extract_and_upsert_graph(documents: List[Document], source: str) -> N
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     successful_extractions = 0
+    all_entities = []
+    all_keywords = []
+    
     for i, res in enumerate(results):
         if isinstance(res, Exception):
             logger.debug(f"KG extract skip page {i*step+1}: {res}")
@@ -697,9 +766,30 @@ async def _extract_and_upsert_graph(documents: List[Document], source: str) -> N
         if res and (res.get('nodes') or res.get('edges')):
             page_num = int(documents[i*step].metadata.get('page', i*step + 1)) if documents[i*step].metadata else (i*step + 1)
             _upsert_graph_json(res, source, page_num)
+            
+            # Collect entities and keywords for embedding creation
+            if res.get('nodes'):
+                all_entities.extend(res['nodes'])
+            if res.get('edges'):
+                # Extract keywords from edge properties
+                for edge in res['edges']:
+                    if edge.get('properties'):
+                        for key, value in edge['properties'].items():
+                            if isinstance(value, str) and len(value.strip()) > 3:
+                                all_keywords.append(value.strip())
+            
             successful_extractions += 1
     
     logger.info(f"✅ Successfully extracted graph data from {successful_extractions}/{len(tasks)} pages")
+    
+    # Create embeddings for entities and keywords
+    if all_entities:
+        logger.info(f"🔧 Creating embeddings for {len(all_entities)} entities...")
+        await _create_entity_embeddings(all_entities, source)
+    
+    if all_keywords:
+        logger.info(f"🔧 Creating embeddings for {len(all_keywords)} keywords...")
+        await _create_keyword_embeddings(all_keywords, source)
 
 async def _process_pdf_page(file_path: str, page_num: int) -> str:
     """Helper function to extract text from a single PDF page concurrently."""
@@ -761,10 +851,6 @@ async def _load_and_index_from_url(document_url: str):
             
             pdf_document.close()
             
-        except Exception as e:
-            logger.error(f"❌ PDF processing failed: {e}")
-            raise
-        
         finally:
             # Clean up temporary file
             try:
@@ -911,79 +997,162 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
                     except Exception as e:
                         graph_context += f"[GRAPH ERROR - Fulltext]: {e}\n"
                     
-                    # 2. Entity search with flexible matching
+                    # 2. FAST VECTOR-BASED Entity search (instead of slow keyword search)
                     try:
-                        # Use query processor for hints
-                        processed_query = await query_processor.process_query(request.query)
-                        keywords = processed_query["enhanced_extraction"].get("key_entities", [])
+                        # Get query embedding
+                        embedding_model = Settings.embed_model
+                        query_embedding = await embedding_model.aget_text_embedding(request.query)
                         
-                        if keywords:
-                            for kw in keywords:
-                                entity_result = session.run(
+                        # Find similar entities using vector similarity
+                        entity_result = session.run(
+                            """
+                            MATCH (e:Entity)
+                            WHERE e.embedding IS NOT NULL
+                            WITH e, gds.similarity.cosine(e.embedding, $query_embedding) AS similarity
+                            WHERE similarity > 0.7
+                            ORDER BY similarity DESC
+                            LIMIT 10
+                            MATCH (e)-[:MENTIONED_IN]->(p:Page)
+                            RETURN e.name, e.type, p.page, p.text, similarity
+                            ORDER BY similarity DESC, p.page
+                            """,
+                            query_embedding=query_embedding
+                        ).data()
+                        
+                        if entity_result:
+                            logger.info(f"✅ Vector entity search found {len(entity_result)} similar entities")
+                            graph_context += f"[GRAPH CONTEXT - Vector Entity Search] Found {len(entity_result)} similar entities:\n"
+                            for r in entity_result:
+                                page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')} (similarity: {r.get('similarity', 0):.3f}): {page_text}\n"
+                            graph_context += "\n"
+                            
+                            # Also get related pages for these entities
+                            entity_names = [r.get('name') for r in entity_result[:5]]
+                            if entity_names:
+                                related_pages = session.run(
                                     """
                                     MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
-                                    WHERE toLower(e.name) CONTAINS toLower($kw) 
-                                       OR toLower(e.type) CONTAINS toLower($kw)
-                                       OR toLower($kw) CONTAINS toLower(e.name)
-                                       OR toLower(e.name) CONTAINS toLower($kw)
-                                    RETURN e.name, e.type, p.page, p.text
+                                    WHERE e.name IN $entity_names
+                                    RETURN DISTINCT p.page, p.text
                                     ORDER BY p.page
-                                    LIMIT 20
+                                    LIMIT 8
                                     """,
-                                    kw=kw
+                                    entity_names=entity_names
                                 ).data()
-                                if entity_result:
-                                    graph_context += f"[GRAPH CONTEXT - Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
-                                    for r in entity_result:
-                                        page_text = r.get('text', '')[:600] + "..." if len(r.get('text', '')) > 600 else r.get('text', '')
-                                        graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
+                                
+                                if related_pages:
+                                    graph_context += f"[GRAPH CONTEXT - Related Pages] Found {len(related_pages)} related pages:\n"
+                                    for r in related_pages:
+                                        page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                        graph_context += f"Page {r.get('page')}: {page_text}\n"
                                     graph_context += "\n"
-                    except Exception as e:
-                        graph_context += f"[GRAPH ERROR - Entity Search]: {e}\n"
                     
-                    # 3. Direct page search for key terms (universal for any document type)
-                    try:
-                        # Extract key terms from the question itself
-                        question_lower = request.query.lower()
-                        key_terms = []
-                        
-                        # Common terms that might appear in any document
-                        universal_terms = ["definition", "formula", "equation", "method", "procedure", "process", "system", 
-                                         "analysis", "study", "research", "experiment", "test", "measurement", "data",
-                                         "result", "conclusion", "finding", "evidence", "proof", "theory", "model",
-                                         "algorithm", "function", "variable", "parameter", "condition", "requirement",
-                                         "specification", "standard", "protocol", "guideline", "rule", "law", "policy",
-                                         "regulation", "statute", "clause", "section", "article", "chapter", "part"]
-                        
-                        # Add terms that appear in the question
-                        for term in universal_terms:
-                            if term in question_lower:
-                                key_terms.append(term)
-                        
-                        # If no specific terms found, search for common document elements
-                        if not key_terms:
-                            key_terms = ["definition", "formula", "method", "procedure", "analysis"]
-                        
-                        for term in key_terms:
-                            term_result = session.run(
-                                """
-                                MATCH (p:Page)
-                                WHERE toLower(p.text) CONTAINS toLower($term)
-                                RETURN p.page, p.text
-                                ORDER BY p.page
-                                LIMIT 12
-                                """,
-                                term=term
-                            ).data()
-                            if term_result:
-                                graph_context += f"[GRAPH CONTEXT - Key Term '{term}'] Found on {len(term_result)} pages:\n"
-                                for r in term_result:
-                                    page_text = r.get('text', '')[:700] + "..." if len(r.get('text', '')) > 700 else r.get('text', '')
-                                    graph_context += f"Page {r.get('page')}: {page_text}\n"
-                                graph_context += "\n"
-                            break  # Only search for the first matching term
                     except Exception as e:
-                        graph_context += f"[GRAPH ERROR - Key Term Search]: {e}\n"
+                        logger.error(f"❌ Vector entity search error: {e}")
+                        # Fallback to keyword search if vector search fails
+                        try:
+                            processed_query = await query_processor.process_query(request.query)
+                            keywords = processed_query["enhanced_extraction"].get("key_entities", [])
+                            logger.info(f"🔍 Fallback: Extracted keywords: {keywords}")
+                            
+                            if keywords:
+                                for kw in keywords:
+                                    entity_result = session.run(
+                                        """
+                                        MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
+                                        WHERE toLower(e.name) CONTAINS toLower($kw) 
+                                           OR toLower(e.type) CONTAINS toLower($kw)
+                                           OR toLower($kw) CONTAINS toLower(e.name)
+                                        RETURN e.name, e.type, p.page, p.text
+                                        ORDER BY p.page
+                                        LIMIT 10
+                                        """,
+                                        kw=kw
+                                    ).data()
+                                    if entity_result:
+                                        logger.info(f"✅ Fallback entity search for '{kw}' found {len(entity_result)} matches")
+                                        graph_context += f"[GRAPH CONTEXT - Fallback Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
+                                        for r in entity_result:
+                                            page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                            graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
+                                        graph_context += "\n"
+                        except Exception as fallback_e:
+                            logger.error(f"❌ Fallback entity search error: {fallback_e}")
+                                
+                    # 3. FAST VECTOR-BASED Keyword search (instead of slow text search)
+                    try:
+                        # Find similar keywords using vector similarity
+                        keyword_result = session.run(
+                            """
+                            MATCH (k:Keyword)
+                            WHERE k.embedding IS NOT NULL
+                            WITH k, gds.similarity.cosine(k.embedding, $query_embedding) AS similarity
+                            WHERE similarity > 0.6
+                            ORDER BY similarity DESC
+                            LIMIT 5
+                            RETURN k.text, similarity
+                            """,
+                            query_embedding=query_embedding
+                        ).data()
+                        
+                        if keyword_result:
+                            logger.info(f"✅ Vector keyword search found {len(keyword_result)} similar keywords")
+                            graph_context += f"[GRAPH CONTEXT - Vector Keyword Search] Found {len(keyword_result)} similar keywords:\n"
+                            for r in keyword_result:
+                                graph_context += f"- {r.get('text')} (similarity: {r.get('similarity', 0):.3f})\n"
+                            graph_context += "\n"
+                            
+                            # Search for these keywords in pages
+                            keyword_texts = [r.get('text') for r in keyword_result]
+                            if keyword_texts:
+                                keyword_pages = session.run(
+                                    """
+                                    MATCH (p:Page)
+                                    WHERE ANY(kw IN $keywords WHERE toLower(p.text) CONTAINS toLower(kw))
+                                    RETURN p.page, p.text
+                                    ORDER BY p.page
+                                    LIMIT 6
+                                    """,
+                                    keywords=keyword_texts
+                                ).data()
+                                
+                                if keyword_pages:
+                                    graph_context += f"[GRAPH CONTEXT - Keyword Pages] Found {len(keyword_pages)} relevant pages:\n"
+                                    for r in keyword_pages:
+                                        page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                        graph_context += f"Page {r.get('page')}: {page_text}\n"
+                                    graph_context += "\n"
+                    
+                    except Exception as e:
+                        logger.error(f"❌ Vector keyword search error: {e}")
+                        # Fallback to key term search
+                        try:
+                            question_lower = request.query.lower()
+                            key_terms = ["definition", "formula", "method", "procedure", "policy", "condition", "requirement"]
+                            
+                            for term in key_terms:
+                                if term in question_lower:
+                                    term_result = session.run(
+                                        """
+                                        MATCH (p:Page)
+                                        WHERE toLower(p.text) CONTAINS toLower($term)
+                                        RETURN p.page, p.text
+                                        ORDER BY p.page
+                                        LIMIT 6
+                                        """,
+                                        term=term
+                                    ).data()
+                                    if term_result:
+                                        logger.info(f"✅ Fallback key term '{term}' found on {len(term_result)} pages")
+                                        graph_context += f"[GRAPH CONTEXT - Fallback Key Term '{term}'] Found on {len(term_result)} pages:\n"
+                                        for r in term_result:
+                                            page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                            graph_context += f"Page {r.get('page')}: {page_text}\n"
+                                        graph_context += "\n"
+                                    break
+                        except Exception as fallback_e:
+                            logger.error(f"❌ Fallback key term search error: {fallback_e}")
                     
                     # 4. Get general entity overview if no specific results
                     if len(graph_context.strip()) < 100:  # If we got very little context
@@ -1198,63 +1367,162 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
                                 except Exception as e:
                                     logger.error(f"❌ Fulltext search error: {e}")
                                 
-                                # 2. Entity search
+                                # 2. FAST VECTOR-BASED Entity search (instead of slow keyword search)
                                 try:
-                                    processed_query = await query_processor.process_query(question)
-                                    keywords = processed_query["enhanced_extraction"].get("key_entities", [])
-                                    logger.info(f"🔍 Extracted keywords: {keywords}")
+                                    # Get query embedding
+                                    embedding_model = Settings.embed_model
+                                    query_embedding = await embedding_model.aget_text_embedding(question)
                                     
-                                    if keywords:
-                                        for kw in keywords:
-                                            entity_result = session.run(
+                                    # Find similar entities using vector similarity
+                                    entity_result = session.run(
+                                        """
+                                        MATCH (e:Entity)
+                                        WHERE e.embedding IS NOT NULL
+                                        WITH e, gds.similarity.cosine(e.embedding, $query_embedding) AS similarity
+                                        WHERE similarity > 0.7
+                                        ORDER BY similarity DESC
+                                        LIMIT 10
+                                        MATCH (e)-[:MENTIONED_IN]->(p:Page)
+                                        RETURN e.name, e.type, p.page, p.text, similarity
+                                        ORDER BY similarity DESC, p.page
+                                        """,
+                                        query_embedding=query_embedding
+                                    ).data()
+                                    
+                                    if entity_result:
+                                        logger.info(f"✅ Vector entity search found {len(entity_result)} similar entities")
+                                        graph_context += f"[GRAPH CONTEXT - Vector Entity Search] Found {len(entity_result)} similar entities:\n"
+                                        for r in entity_result:
+                                            page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                            graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')} (similarity: {r.get('similarity', 0):.3f}): {page_text}\n"
+                                        graph_context += "\n"
+                                        
+                                        # Also get related pages for these entities
+                                        entity_names = [r.get('name') for r in entity_result[:5]]
+                                        if entity_names:
+                                            related_pages = session.run(
                                                 """
                                                 MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
-                                                WHERE toLower(e.name) CONTAINS toLower($kw) 
-                                                   OR toLower(e.type) CONTAINS toLower($kw)
-                                                   OR toLower($kw) CONTAINS toLower(e.name)
-                                                RETURN e.name, e.type, p.page, p.text
-                                                ORDER BY p.page
-                                                LIMIT 15
-                                                """,
-                                                kw=kw
-                                            ).data()
-                                            if entity_result:
-                                                logger.info(f"✅ Entity search for '{kw}' found {len(entity_result)} matches")
-                                                graph_context += f"[GRAPH CONTEXT - Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
-                                                for r in entity_result:
-                                                    page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
-                                                    graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
-                                                graph_context += "\n"
-                                except Exception as e:
-                                    logger.error(f"❌ Entity search error: {e}")
-                                
-                                # 3. Key term search
-                                try:
-                                    question_lower = question.lower()
-                                    key_terms = ["definition", "formula", "method", "procedure", "policy", "condition", "requirement"]
-                                    
-                                    for term in key_terms:
-                                        if term in question_lower:
-                                            term_result = session.run(
-                                                """
-                                                MATCH (p:Page)
-                                                WHERE toLower(p.text) CONTAINS toLower($term)
-                                                RETURN p.page, p.text
+                                                WHERE e.name IN $entity_names
+                                                RETURN DISTINCT p.page, p.text
                                                 ORDER BY p.page
                                                 LIMIT 8
                                                 """,
-                                                term=term
+                                                entity_names=entity_names
                                             ).data()
-                                            if term_result:
-                                                logger.info(f"✅ Key term '{term}' found on {len(term_result)} pages")
-                                                graph_context += f"[GRAPH CONTEXT - Key Term '{term}'] Found on {len(term_result)} pages:\n"
-                                                for r in term_result:
+                                            
+                                            if related_pages:
+                                                graph_context += f"[GRAPH CONTEXT - Related Pages] Found {len(related_pages)} related pages:\n"
+                                                for r in related_pages:
                                                     page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
                                                     graph_context += f"Page {r.get('page')}: {page_text}\n"
                                                 graph_context += "\n"
-                                            break
+                                    
                                 except Exception as e:
-                                    logger.error(f"❌ Key term search error: {e}")
+                                    logger.error(f"❌ Vector entity search error: {e}")
+                                    # Fallback to keyword search if vector search fails
+                                    try:
+                                        processed_query = await query_processor.process_query(question)
+                                        keywords = processed_query["enhanced_extraction"].get("key_entities", [])
+                                        logger.info(f"🔍 Fallback: Extracted keywords: {keywords}")
+                                        
+                                        if keywords:
+                                            for kw in keywords:
+                                                entity_result = session.run(
+                                                    """
+                                                    MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
+                                                    WHERE toLower(e.name) CONTAINS toLower($kw) 
+                                                       OR toLower(e.type) CONTAINS toLower($kw)
+                                                       OR toLower($kw) CONTAINS toLower(e.name)
+                                                    RETURN e.name, e.type, p.page, p.text
+                                                    ORDER BY p.page
+                                                    LIMIT 10
+                                                    """,
+                                                    kw=kw
+                                                ).data()
+                                                if entity_result:
+                                                    logger.info(f"✅ Fallback entity search for '{kw}' found {len(entity_result)} matches")
+                                                    graph_context += f"[GRAPH CONTEXT - Fallback Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
+                                                    for r in entity_result:
+                                                        page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                                        graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
+                                                    graph_context += "\n"
+                                    except Exception as fallback_e:
+                                        logger.error(f"❌ Fallback entity search error: {fallback_e}")
+                                
+                                # 3. FAST VECTOR-BASED Keyword search (instead of slow text search)
+                                try:
+                                    # Find similar keywords using vector similarity
+                                    keyword_result = session.run(
+                                        """
+                                        MATCH (k:Keyword)
+                                        WHERE k.embedding IS NOT NULL
+                                        WITH k, gds.similarity.cosine(k.embedding, $query_embedding) AS similarity
+                                        WHERE similarity > 0.6
+                                        ORDER BY similarity DESC
+                                        LIMIT 5
+                                        RETURN k.text, similarity
+                                        """,
+                                        query_embedding=query_embedding
+                                    ).data()
+                                    
+                                    if keyword_result:
+                                        logger.info(f"✅ Vector keyword search found {len(keyword_result)} similar keywords")
+                                        graph_context += f"[GRAPH CONTEXT - Vector Keyword Search] Found {len(keyword_result)} similar keywords:\n"
+                                        for r in keyword_result:
+                                            graph_context += f"- {r.get('text')} (similarity: {r.get('similarity', 0):.3f})\n"
+                                        graph_context += "\n"
+                                        
+                                        # Search for these keywords in pages
+                                        keyword_texts = [r.get('text') for r in keyword_result]
+                                        if keyword_texts:
+                                            keyword_pages = session.run(
+                                                """
+                                                MATCH (p:Page)
+                                                WHERE ANY(kw IN $keywords WHERE toLower(p.text) CONTAINS toLower(kw))
+                                                RETURN p.page, p.text
+                                                ORDER BY p.page
+                                                LIMIT 6
+                                                """,
+                                                keywords=keyword_texts
+                                            ).data()
+                                            
+                                            if keyword_pages:
+                                                graph_context += f"[GRAPH CONTEXT - Keyword Pages] Found {len(keyword_pages)} relevant pages:\n"
+                                                for r in keyword_pages:
+                                                    page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                                    graph_context += f"Page {r.get('page')}: {page_text}\n"
+                                                graph_context += "\n"
+                                    
+                                except Exception as e:
+                                    logger.error(f"❌ Vector keyword search error: {e}")
+                                    # Fallback to key term search
+                                    try:
+                                        question_lower = question.lower()
+                                        key_terms = ["definition", "formula", "method", "procedure", "policy", "condition", "requirement"]
+                                        
+                                        for term in key_terms:
+                                            if term in question_lower:
+                                                term_result = session.run(
+                                                    """
+                                                    MATCH (p:Page)
+                                                    WHERE toLower(p.text) CONTAINS toLower($term)
+                                                    RETURN p.page, p.text
+                                                    ORDER BY p.page
+                                                    LIMIT 6
+                                                    """,
+                                                    term=term
+                                                ).data()
+                                                if term_result:
+                                                    logger.info(f"✅ Fallback key term '{term}' found on {len(term_result)} pages")
+                                                    graph_context += f"[GRAPH CONTEXT - Fallback Key Term '{term}'] Found on {len(term_result)} pages:\n"
+                                                    for r in term_result:
+                                                        page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                                        graph_context += f"Page {r.get('page')}: {page_text}\n"
+                                                    graph_context += "\n"
+                                                break
+                                    except Exception as fallback_e:
+                                        logger.error(f"❌ Fallback key term search error: {fallback_e}")
                                     
                     except Exception as e:
                         logger.error(f"❌ Graph search error: {e}")
