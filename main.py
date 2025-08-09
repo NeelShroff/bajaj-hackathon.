@@ -399,28 +399,55 @@ def _neo4j_ensure_indexes() -> None:
     except Exception as e:
         logger.debug(f"Neo4j index creation warning: {e}")
 
-def _neo4j_upsert_pages(source_url: str, pages: List[Document]) -> None:
-    if neo4j_driver is None:
+def _neo4j_upsert_pages(pages: List[Dict[str, Any]], source: str) -> None:
+    """Upsert pages to Neo4j with better constraint handling."""
+    if not pages or neo4j_driver is None:
         return
+    
     try:
         with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
-            for doc in pages:
-                page_no = int(doc.metadata.get("page", 0)) if doc.metadata else 0
-                text = doc.text or ""
+            # First, try to create the document node with ON CREATE
+            try:
                 session.run(
-                    (
-                        "MERGE (d:Document {source: $source}) "
-                        "ON CREATE SET d.createdAt = timestamp() "
-                        "MERGE (p:Page {source: $source, page: $page}) "
-                        "SET p.text = $text "
-                        "MERGE (d)-[:HAS_PAGE]->(p)"
-                    ),
-                    source=source_url,
-                    page=page_no,
-                    text=text,
+                    "MERGE (d:Document {source: $source}) ON CREATE SET d.createdAt = timestamp() SET d.updatedAt = timestamp()",
+                    source=source
                 )
+            except Exception as e:
+                logger.warning(f"Document node creation failed: {e}")
+            
+            # Then upsert pages with better error handling
+            for page_data in pages:
+                page_num = page_data.get('page_num', 0)
+                text = page_data.get('text', '')
+                
+                if not text.strip():
+                    continue
+                
+                try:
+                    # Use MERGE to avoid constraint violations
+                    session.run(
+                        """
+                        MERGE (p:Page {source: $source, page: $page})
+                        ON CREATE SET p.text = $text, p.createdAt = timestamp()
+                        SET p.updatedAt = timestamp(), p.text = $text
+                        """,
+                        source=source, page=page_num, text=text
+                    )
+                    
+                    # Create relationship to document
+                    session.run(
+                        """
+                        MATCH (d:Document {source: $source})
+                        MATCH (p:Page {source: $source, page: $page})
+                        MERGE (d)-[:HAS_PAGE]->(p)
+                        """,
+                        source=source, page=page_num
+                    )
+                except Exception as e:
+                    logger.warning(f"Page upsert failed for page {page_num}: {e}")
+                    
     except Exception as e:
-        logger.warning(f"Neo4j upsert pages failed: {e}")
+        logger.error(f"Neo4j pages upsert failed: {e}")
 
 
 # --------- LLM-driven KG extraction (entities + relations) ---------
@@ -533,6 +560,8 @@ Rules:
 - Adapt to the document type (scientific, legal, technical, etc.)
 - IMPORTANT: All property values must be single strings, not arrays or lists
 - If you have multiple values, combine them into a single comma-separated string
+- CRITICAL: NEVER create nodes with type "Document", "Doc", "File", or "PDF" - these are reserved
+- Only create nodes for actual content entities, concepts, terms, etc.
 
 Page meta: source={source}, page={page_num}
 Page text:
@@ -560,7 +589,7 @@ def _upsert_graph_json(graph: Dict[str, Any], source: str, page_num: int) -> Non
     edges = graph.get('edges') or []
     try:
         with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
-            # Upsert nodes
+            # Upsert nodes with better constraint handling
             for n in nodes:
                 name = str(n.get('name', '')).strip()
                 ntype = str(n.get('type', 'Entity')).strip() or 'Entity'
@@ -580,18 +609,34 @@ def _upsert_graph_json(graph: Dict[str, Any], source: str, page_num: int) -> Non
                 
                 if not name:
                     continue
+                
+                # CRITICAL: Never create Document nodes - only Entity nodes
+                # If the LLM extracted a Document node, skip it or convert to Entity
+                if ntype.lower() in ['document', 'doc', 'file', 'pdf']:
+                    logger.debug(f"Skipping Document node: {name}")
+                    continue
+                
+                # Use a safe label that won't conflict with existing constraints
                 label = _sanitize_label(ntype)
-                cy = (
-                    f"MERGE (e:Entity:`{label}` {{source:$source, name:$name, type:$type}}) "
-                    f"ON CREATE SET e.firstSeenAt=timestamp() "
-                    f"SET e.lastSeenAt=timestamp(), e += $props "
-                    f"WITH e "
-                    f"MERGE (p:Page {{source:$source, page:$page}}) "
-                    f"MERGE (e)-[:MENTIONED_IN]->(p)"
-                )
-                session.run(cy, source=source, name=name, type=ntype, props=cleaned_props, page=page_num)
+                if label.lower() in ['document', 'doc', 'file', 'pdf']:
+                    label = 'Entity'  # Fallback to Entity label
+                
+                try:
+                    # Use MERGE with ON CREATE to avoid constraint violations
+                    # Only create Entity nodes, never Document nodes
+                    cy = (
+                        f"MERGE (e:Entity {{source:$source, name:$name, type:$type}}) "
+                        f"ON CREATE SET e.firstSeenAt=timestamp(), e += $props "
+                        f"SET e.lastSeenAt=timestamp(), e += $props "
+                        f"WITH e "
+                        f"MATCH (p:Page {{source:$source, page:$page}}) "
+                        f"MERGE (e)-[:MENTIONED_IN]->(p)"
+                    )
+                    session.run(cy, source=source, name=name, type=ntype, props=cleaned_props, page=page_num)
+                except Exception as e:
+                    logger.warning(f"Node upsert failed for {name}: {e}")
             
-            # Upsert edges
+            # Upsert edges with better relationship handling
             for e in edges:
                 sname = str(e.get('source', '')).strip()
                 tname = str(e.get('target', '')).strip()
@@ -610,14 +655,23 @@ def _upsert_graph_json(graph: Dict[str, Any], source: str, page_num: int) -> Non
                     else:
                         cleaned_eprops[key] = str(value) if value is not None else ''
                 
-                if not sname or not tname:
+                if not sname or not tname or sname == tname:
                     continue
-                cy = (
-                    "MATCH (a:Entity {source:$source, name:$sname}), (b:Entity {source:$source, name:$tname}) "
-                    f"MERGE (a)-[r:`{rel}` {{source:$source}}]->(b) "
-                    "SET r += $props"
-                )
-                session.run(cy, source=source, sname=sname, tname=tname, props=cleaned_eprops)
+                
+                try:
+                    # Use a more efficient approach to avoid cartesian product
+                    # First check if both nodes exist, then create relationship
+                    cy = (
+                        f"MATCH (a:Entity {{source:$source, name:$sname}}) "
+                        f"MATCH (b:Entity {{source:$source, name:$tname}}) "
+                        f"WHERE a <> b "
+                        f"WITH a, b "
+                        f"MERGE (a)-[r:{rel} {{source:$source}}]->(b) "
+                        f"SET r += $props"
+                    )
+                    session.run(cy, source=source, sname=sname, tname=tname, props=cleaned_eprops)
+                except Exception as e:
+                    logger.warning(f"Edge upsert failed for {sname}->{tname}: {e}")
     except Exception as e:
         logger.warning(f"Neo4j upsert KG failed: {e}")
 
@@ -725,7 +779,18 @@ async def _load_and_index_from_url(document_url: str):
         
         # Persist in Neo4j synchronously to guarantee graph availability
         _neo4j_ensure_indexes()
-        _neo4j_upsert_pages(document_url, documents)
+        
+        # Convert documents to the expected format
+        pages_data = []
+        for doc in documents:
+            page_no = int(doc.metadata.get("page", 0)) if doc.metadata else 0
+            text = doc.text or ""
+            pages_data.append({
+                'page_num': page_no,
+                'text': text
+            })
+        
+        _neo4j_upsert_pages(pages_data, document_url)
         
         # Extract higher-level nodes/relations from each page (LLM) and upsert to Neo4j
         try:
@@ -841,7 +906,7 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
                         if fulltext_result:
                             graph_context += f"[GRAPH CONTEXT - Fulltext Search] Found {len(fulltext_result)} relevant pages:\n"
                             for r in fulltext_result:
-                                page_text = r.get('text', '')[:600] + "..." if len(r.get('text', '')) > 600 else r.get('text', '')
+                                page_text = r.get('text', '')[:800] + "..." if len(r.get('text', '')) > 800 else r.get('text', '')
                                 graph_context += f"Page {r.get('page')} (score: {r.get('score', 0):.2f}): {page_text}\n\n"
                     except Exception as e:
                         graph_context += f"[GRAPH ERROR - Fulltext]: {e}\n"
@@ -870,7 +935,7 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
                                 if entity_result:
                                     graph_context += f"[GRAPH CONTEXT - Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
                                     for r in entity_result:
-                                        page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                        page_text = r.get('text', '')[:600] + "..." if len(r.get('text', '')) > 600 else r.get('text', '')
                                         graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
                                     graph_context += "\n"
                     except Exception as e:
@@ -913,7 +978,7 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
                             if term_result:
                                 graph_context += f"[GRAPH CONTEXT - Key Term '{term}'] Found on {len(term_result)} pages:\n"
                                 for r in term_result:
-                                    page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                    page_text = r.get('text', '')[:700] + "..." if len(r.get('text', '')) > 700 else r.get('text', '')
                                     graph_context += f"Page {r.get('page')}: {page_text}\n"
                                 graph_context += "\n"
                             break  # Only search for the first matching term
@@ -943,26 +1008,28 @@ async def process_query(request: QueryRequest, token: str = Depends(verify_token
 
         # STEP 2: Use graph context to generate LLM answer
         if graph_context.strip():
-            # Create a better prompt that encourages detailed answers
+            # Create a very aggressive prompt that forces information extraction
             llm_prompt = f"""
-You are an expert document analyst. Answer the question based on the provided document context.
+You are an expert document analyst. Your task is to extract and present ANY relevant information from the provided document context.
 
 QUESTION: {request.query}
 
 DOCUMENT CONTEXT:
 {graph_context}
 
-INSTRUCTIONS:
-- Use the information from the document context above to provide a detailed answer
-- If the context contains relevant information, provide a comprehensive answer with specific details
-- Cite page numbers when available from the context
-- Use exact terminology from the document
-- For scientific content: include formulas, measurements, technical details
-- For legal/policy content: include specific clauses, conditions, regulations
-- If the context has some information but not complete, provide what you can find and mention what's missing
-- Only say "cannot provide complete answer" if the context has NO relevant information at all
+CRITICAL INSTRUCTIONS:
+- You MUST extract and present ANY relevant information you can find in the context
+- Do NOT say "cannot provide complete answer" unless the context has ZERO relevant information
+- If you see ANY text that relates to the question, present it as an answer
+- Look for keywords, definitions, numbers, dates, conditions, requirements, etc.
+- Even if information is incomplete, present what you find
+- Be aggressive in finding and presenting relevant content
+- Use exact quotes from the context when available
+- Cite page numbers when mentioned in the context
+- If you find partial information, present it and note what's missing
+- The goal is to provide useful information, not perfect completeness
 
-ANSWER:
+ANSWER (be aggressive in extracting information):
 """
             try:
                 llm = Settings.llm
@@ -970,7 +1037,7 @@ ANSWER:
                 answer = llm_response.text if hasattr(llm_response, "text") else str(llm_response)
                 
                 # Check if the answer is too generic and try vector search as backup
-                if "cannot provide complete answer" in answer.lower() or len(answer.strip()) < 50:
+                if "cannot provide complete answer" in answer.lower() or "does not contain specific information" in answer.lower() or "does not contain specific" in answer.lower() or len(answer.strip()) < 100:
                     logger.info("🔄 Graph context insufficient, trying vector search as backup...")
                     try:
                         vector_resp = await query_engine.aquery(request.query)
@@ -1087,180 +1154,153 @@ async def process_batch_queries(request: BatchQueryRequest, token: str = Depends
         node_postprocessors=[LongContextReorder()],
     )
 
-    async def process_single_question(question: str):
-        logger.info(f"  - Starting query for question: '{question}'")
-
+    async def process_single_question(question: str) -> str:
+        """Process a single question using PARALLEL semantic and graph search for faster response times."""
         try:
-            # STEP 1: First fetch all context from graph database
-            graph_context = ""
-            logger.info(f"🔍 Starting graph context extraction for question: {question}")
-            try:
+            # PARALLEL PROCESSING: Run semantic and graph search simultaneously
+            logger.info(f"🚀 Starting PARALLEL search for: {question}")
+            
+            async def semantic_search_task():
+                """Semantic search task running in parallel."""
+                try:
+                    vector_resp = await query_engine.aquery(question)
+                    semantic_answer = str(vector_resp) if vector_resp else ""
+                    logger.info(f"✅ Semantic search completed, found {len(semantic_answer)} characters")
+                    return semantic_answer
+                except Exception as e:
+                    logger.warning(f"❌ Semantic search failed: {e}")
+                    return ""
+            
+            async def graph_search_task():
+                """Graph search task running in parallel."""
+                graph_context = ""
                 if neo4j_driver is not None:
-                    # Use synchronous session instead of async
-                    with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
-                        # Get the document source from Neo4j
-                        source_result = session.run("MATCH (d:Document) RETURN d.source AS source LIMIT 1").single()
-                        source = source_result["source"] if source_result else ""
-                        logger.info(f"📄 Found document source: {source[:50]}...")
-                        
-                        # 1. Fulltext search on pages (most important)
-                        try:
-                            logger.info(f"🔎 Performing fulltext search for: {question}")
-                            fulltext_result = session.run(
-                                "CALL db.index.fulltext.queryNodes('pageTextIndex', $q) YIELD node, score RETURN node.text, node.page, score ORDER BY score DESC LIMIT 15",
-                                q=question
-                            ).data()
-                            if fulltext_result:
-                                logger.info(f"✅ Fulltext search found {len(fulltext_result)} relevant pages")
-                                graph_context += f"[GRAPH CONTEXT - Fulltext Search] Found {len(fulltext_result)} relevant pages:\n"
-                                for r in fulltext_result:
-                                    page_text = r.get('text', '')[:600] + "..." if len(r.get('text', '')) > 600 else r.get('text', '')
-                                    graph_context += f"Page {r.get('page')} (score: {r.get('score', 0):.2f}): {page_text}\n\n"
-                            else:
-                                logger.warning("⚠️ Fulltext search returned no results")
-                        except Exception as e:
-                            logger.error(f"❌ Fulltext search error: {e}")
-                            graph_context += f"[GRAPH ERROR - Fulltext]: {e}\n"
-                        
-                        # 2. Entity search with flexible matching
-                        try:
-                            # Use query processor for hints
-                            processed_query = await query_processor.process_query(question)
-                            keywords = processed_query["enhanced_extraction"].get("key_entities", [])
-                            logger.info(f"🔍 Extracted keywords: {keywords}")
-                            
-                            if keywords:
-                                for kw in keywords:
-                                    entity_result = session.run(
-                                        """
-                                        MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
-                                        WHERE toLower(e.name) CONTAINS toLower($kw) 
-                                           OR toLower(e.type) CONTAINS toLower($kw)
-                                           OR toLower($kw) CONTAINS toLower(e.name)
-                                           OR toLower(e.name) CONTAINS toLower($kw)
-                                        RETURN e.name, e.type, p.page, p.text
-                                        ORDER BY p.page
-                                        LIMIT 20
-                                        """,
-                                        kw=kw
+                    try:
+                        with neo4j_driver.session(database=config.NEO4J_DATABASE) as session:
+                            # Get document source
+                            doc_result = session.run("MATCH (d:Document) RETURN d.source LIMIT 1").data()
+                            if doc_result:
+                                source = doc_result[0].get('source', '')
+                                logger.info(f"📄 Found document source: {source[:50]}...")
+                                
+                                # 1. Fulltext search on pages
+                                try:
+                                    fulltext_result = session.run(
+                                        "CALL db.index.fulltext.queryNodes('pageTextIndex', $q) YIELD node, score RETURN node.text, node.page, score ORDER BY score DESC LIMIT 10",
+                                        q=question
                                     ).data()
-                                    if entity_result:
-                                        logger.info(f"✅ Entity search for '{kw}' found {len(entity_result)} matches")
-                                        graph_context += f"[GRAPH CONTEXT - Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
-                                        for r in entity_result:
-                                            page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
-                                            graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
-                                        graph_context += "\n"
-                                    else:
-                                        logger.warning(f"⚠️ Entity search for '{kw}' returned no results")
-                        except Exception as e:
-                            logger.error(f"❌ Entity search error: {e}")
-                            graph_context += f"[GRAPH ERROR - Entity Search]: {e}\n"
-                        
-                        # 3. Direct page search for key terms (universal for any document type)
-                        try:
-                            # Extract key terms from the question itself
-                            question_lower = question.lower()
-                            key_terms = []
-                            
-                            # Common terms that might appear in any document
-                            universal_terms = ["definition", "formula", "equation", "method", "procedure", "process", "system", 
-                                             "analysis", "study", "research", "experiment", "test", "measurement", "data",
-                                             "result", "conclusion", "finding", "evidence", "proof", "theory", "model",
-                                             "algorithm", "function", "variable", "parameter", "condition", "requirement",
-                                             "specification", "standard", "protocol", "guideline", "rule", "law", "policy",
-                                             "regulation", "statute", "clause", "section", "article", "chapter", "part"]
-                            
-                            # Add terms that appear in the question
-                            for term in universal_terms:
-                                if term in question_lower:
-                                    key_terms.append(term)
-                            
-                            # If no specific terms found, search for common document elements
-                            if not key_terms:
-                                key_terms = ["definition", "formula", "method", "procedure", "analysis"]
-                            
-                            for term in key_terms:
-                                logger.info(f"🔍 Searching for key term: {term}")
-                                term_result = session.run(
-                                    """
-                                    MATCH (p:Page)
-                                    WHERE toLower(p.text) CONTAINS toLower($term)
-                                    RETURN p.page, p.text
-                                    ORDER BY p.page
-                                    LIMIT 12
-                                    """,
-                                    term=term
-                                ).data()
-                                if term_result:
-                                    logger.info(f"✅ Key term '{term}' found on {len(term_result)} pages")
-                                    graph_context += f"[GRAPH CONTEXT - Key Term '{term}'] Found on {len(term_result)} pages:\n"
-                                    for r in term_result:
-                                        page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
-                                        graph_context += f"Page {r.get('page')}: {page_text}\n"
-                                    graph_context += "\n"
-                                else:
-                                    logger.warning(f"⚠️ Key term '{term}' not found")
-                                break  # Only search for the first matching term
-                        except Exception as e:
-                            logger.error(f"❌ Key term search error: {e}")
-                            graph_context += f"[GRAPH ERROR - Key Term Search]: {e}\n"
-                        
-                        # 4. Get general entity overview if no specific results
-                        if len(graph_context.strip()) < 100:  # If we got very little context
-                            try:
-                                logger.info("🔍 Getting general entity overview as fallback")
-                                general_entities = session.run(
-                                    """
-                                    MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
-                                    RETURN e.name, e.type, p.page
-                                    ORDER BY p.page
-                                    LIMIT 25
-                                    """
-                                ).data()
-                                if general_entities:
-                                    logger.info(f"✅ Found {len(general_entities)} general entities")
-                                    graph_context += f"[GRAPH CONTEXT - General Entities] Found {len(general_entities)} entities across pages:\n"
-                                    for r in general_entities:
-                                        graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}\n"
-                                    graph_context += "\n"
-                                else:
-                                    logger.warning("⚠️ No general entities found")
-                            except Exception as e:
-                                logger.error(f"❌ General entities error: {e}")
-                                graph_context += f"[GRAPH ERROR - General Entities]: {e}\n"
-            except Exception as e:
-                logger.error(f"❌ Graph context extraction failed: {e}")
-                graph_context = f"[GRAPH ERROR - Connection]: {e}\n"
+                                    if fulltext_result:
+                                        logger.info(f"✅ Fulltext search found {len(fulltext_result)} relevant pages")
+                                        graph_context += f"[GRAPH CONTEXT - Fulltext Search] Found {len(fulltext_result)} relevant pages:\n"
+                                        for r in fulltext_result:
+                                            page_text = r.get('text', '')[:600] + "..." if len(r.get('text', '')) > 600 else r.get('text', '')
+                                            graph_context += f"Page {r.get('page')} (score: {r.get('score', 0):.2f}): {page_text}\n\n"
+                                except Exception as e:
+                                    logger.error(f"❌ Fulltext search error: {e}")
+                                
+                                # 2. Entity search
+                                try:
+                                    processed_query = await query_processor.process_query(question)
+                                    keywords = processed_query["enhanced_extraction"].get("key_entities", [])
+                                    logger.info(f"🔍 Extracted keywords: {keywords}")
+                                    
+                                    if keywords:
+                                        for kw in keywords:
+                                            entity_result = session.run(
+                                                """
+                                                MATCH (e:Entity)-[:MENTIONED_IN]->(p:Page)
+                                                WHERE toLower(e.name) CONTAINS toLower($kw) 
+                                                   OR toLower(e.type) CONTAINS toLower($kw)
+                                                   OR toLower($kw) CONTAINS toLower(e.name)
+                                                RETURN e.name, e.type, p.page, p.text
+                                                ORDER BY p.page
+                                                LIMIT 15
+                                                """,
+                                                kw=kw
+                                            ).data()
+                                            if entity_result:
+                                                logger.info(f"✅ Entity search for '{kw}' found {len(entity_result)} matches")
+                                                graph_context += f"[GRAPH CONTEXT - Entity Search for '{kw}'] Found {len(entity_result)} matches:\n"
+                                                for r in entity_result:
+                                                    page_text = r.get('text', '')[:400] + "..." if len(r.get('text', '')) > 400 else r.get('text', '')
+                                                    graph_context += f"- {r.get('name')} ({r.get('type')}) on page {r.get('page')}: {page_text}\n"
+                                                graph_context += "\n"
+                                except Exception as e:
+                                    logger.error(f"❌ Entity search error: {e}")
+                                
+                                # 3. Key term search
+                                try:
+                                    question_lower = question.lower()
+                                    key_terms = ["definition", "formula", "method", "procedure", "policy", "condition", "requirement"]
+                                    
+                                    for term in key_terms:
+                                        if term in question_lower:
+                                            term_result = session.run(
+                                                """
+                                                MATCH (p:Page)
+                                                WHERE toLower(p.text) CONTAINS toLower($term)
+                                                RETURN p.page, p.text
+                                                ORDER BY p.page
+                                                LIMIT 8
+                                                """,
+                                                term=term
+                                            ).data()
+                                            if term_result:
+                                                logger.info(f"✅ Key term '{term}' found on {len(term_result)} pages")
+                                                graph_context += f"[GRAPH CONTEXT - Key Term '{term}'] Found on {len(term_result)} pages:\n"
+                                                for r in term_result:
+                                                    page_text = r.get('text', '')[:500] + "..." if len(r.get('text', '')) > 500 else r.get('text', '')
+                                                    graph_context += f"Page {r.get('page')}: {page_text}\n"
+                                                graph_context += "\n"
+                                            break
+                                except Exception as e:
+                                    logger.error(f"❌ Key term search error: {e}")
+                                    
+                    except Exception as e:
+                        logger.error(f"❌ Graph search error: {e}")
+                
+                return graph_context
             
-            logger.info(f"📊 Graph context length: {len(graph_context)} characters")
-            if graph_context.strip():
-                logger.info("✅ Graph context extracted successfully")
-            else:
-                logger.warning("⚠️ No graph context extracted")
+            # RUN BOTH TASKS IN PARALLEL
+            semantic_task = semantic_search_task()
+            graph_task = graph_search_task()
             
-            # STEP 2: Use graph context to generate LLM answer
+            # Wait for both tasks to complete
+            semantic_answer, graph_context = await asyncio.gather(semantic_task, graph_task, return_exceptions=True)
+            
+            # Handle exceptions from parallel tasks
+            if isinstance(semantic_answer, Exception):
+                logger.error(f"❌ Semantic search task failed: {semantic_answer}")
+                semantic_answer = ""
+            if isinstance(graph_context, Exception):
+                logger.error(f"❌ Graph search task failed: {graph_context}")
+                graph_context = ""
+            
+            # STEP 3: Combine results and generate final answer
             if graph_context.strip():
-                # Create a better prompt that encourages detailed answers
+                # Use graph context to enhance the answer
                 llm_prompt = f"""
-You are an expert document analyst. Answer the question based on the provided document context.
-
 QUESTION: {question}
 
-DOCUMENT CONTEXT:
+SEMANTIC SEARCH RESULT:
+{semantic_answer}
+
+GRAPH DATABASE CONTEXT:
 {graph_context}
 
-INSTRUCTIONS:
-- Use the information from the document context above to provide a detailed answer
-- If the context contains relevant information, provide a comprehensive answer with specific details
-- Cite page numbers when available from the context
-- Use exact terminology from the document
-- For scientific content: include formulas, measurements, technical details
-- For legal/policy content: include specific clauses, conditions, regulations
-- If the context has some information but not complete, provide what you can find and mention what's missing
-- Only say "cannot provide complete answer" if the context has NO relevant information at all
+CRITICAL INSTRUCTIONS:
+- You MUST extract and present ANY relevant information you can find in the context
+- Do NOT say "cannot provide complete answer" unless the context has ZERO relevant information
+- If you see ANY text that relates to the question, present it as an answer
+- Look for keywords, definitions, numbers, dates, conditions, requirements, etc.
+- Even if information is incomplete, present what you find
+- Be aggressive in finding and presenting relevant content
+- Use exact quotes from the context when available
+- Cite page numbers when mentioned in the context
+- If you find partial information, present it and note what's missing
+- The goal is to provide useful information, not perfect completeness
 
-ANSWER:
+ANSWER (be aggressive in extracting information):
 """
                 try:
                     llm = Settings.llm
@@ -1268,38 +1308,31 @@ ANSWER:
                     answer = llm_response.text if hasattr(llm_response, "text") else str(llm_response)
                     
                     # Check if the answer is too generic and try vector search as backup
-                    if "cannot provide complete answer" in answer.lower() or len(answer.strip()) < 50:
+                    if "cannot provide complete answer" in answer.lower() or "does not contain specific information" in answer.lower() or "does not contain specific" in answer.lower() or len(answer.strip()) < 100:
                         logger.info("🔄 Graph context insufficient, trying vector search as backup...")
-                        try:
-                            vector_resp = await query_engine.aquery(question)
-                            vector_answer = str(vector_resp) if vector_resp else ""
-                            if vector_answer and len(vector_answer.strip()) > 50:
-                                answer = f"{answer}\n\n[Additional information from document search:]\n{vector_answer}"
-                                logger.info("✅ Enhanced answer with vector search results")
-                        except Exception as e:
-                            logger.warning(f"Vector search backup failed: {e}")
+                        if semantic_answer and len(semantic_answer.strip()) > 50:
+                            answer = f"{answer}\n\n[Additional information from semantic search:]\n{semantic_answer}"
+                            logger.info("✅ Enhanced answer with semantic search results")
                     
                     # Add graph context source information
                     if answer and not answer.strip().startswith("Based on the available document information, I cannot provide a complete answer"):
                         page_count = len([line for line in graph_context.split('\n') if 'Page ' in line])
-                        answer += f"\n\n[Source: Graph database analysis with {page_count} relevant page sections]"
+                        answer += f"\n\n[Source: Parallel search - Graph database ({page_count} pages) + Semantic search]"
                     
                     return answer
                 except Exception as e:
                     logger.error(f"LLM generation failed: {e}")
                     return f"Error generating answer: {e}"
             else:
-                # STEP 3: Fallback to vector search if no graph context
-                try:
-                    vector_resp = await query_engine.aquery(question)
-                    return str(vector_resp) if vector_resp else "No relevant information found in the document."
-                except Exception as e:
-                    logger.error(f"Vector query failed: {e}")
-                    return f"Error retrieving information: {e}"
-
+                # Fallback to semantic search only
+                if semantic_answer:
+                    return f"{semantic_answer}\n\n[Source: Semantic search only - Graph search returned no results]"
+                else:
+                    return "No relevant information found in the document."
+                    
         except Exception as e:
-            logger.error(f"  - Failed to process question '{question}': {e}")
-            return "Error processing this question."
+            logger.error(f"❌ Error processing question: {e}")
+            return f"Error processing question: {e}"
 
     tasks = [process_single_question(q) for q in request.questions]
     answers = await asyncio.gather(*tasks)
